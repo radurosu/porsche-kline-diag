@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+# Trace logs contain VIN / ECU IDs from real cars — keep private.
+logs/*
+!logs/.gitkeep

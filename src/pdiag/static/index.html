@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdiag</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="car">
+    <h1 id="car-name">996</h1>
+    <p id="car-sub">Reading the car…</p>
+  </div>
+  <div id="link-state" class="link-state" role="status"></div>
+</header>
+
+<nav class="tabs" aria-label="Views">
+  <a href="#live" data-view="live">Live</a>
+  <a href="#report" data-view="report">Over-rev report</a>
+  <a href="#codes" data-view="codes">Fault codes</a>
+  <a href="#info" data-view="info">Car info</a>
+</nav>
+
+<main>
+  <section id="view-live" class="view" aria-labelledby="live-h">
+    <h2 id="live-h" class="sr-only">Live engine data</h2>
+    <div class="live">
+      <figure class="tach-wrap">
+        <svg id="tach" viewBox="0 0 400 400" role="img" aria-label="Tachometer"></svg>
+        <figcaption>
+          <span class="rpm" id="rpm-num">0</span>
+          <span class="rpm-unit">rpm</span>
+        </figcaption>
+      </figure>
+      <div class="readouts" id="readouts"></div>
+    </div>
+    <p class="live-note" id="live-note">The colored marks around the dial are the six over-rev ranges. They fill in when the engine has recorded ignitions there.</p>
+  </section>
+
+  <section id="view-report" class="view" aria-labelledby="report-h" hidden>
+    <div class="view-head">
+      <h2 id="report-h">Over-rev report</h2>
+      <button type="button" class="btn" id="print-btn">Print report</button>
+    </div>
+    <div id="report-body" aria-live="polite"></div>
+  </section>
+
+  <section id="view-codes" class="view" aria-labelledby="codes-h" hidden>
+    <div class="view-head">
+      <h2 id="codes-h">Fault codes</h2>
+      <button type="button" class="btn" id="codes-btn">Read again</button>
+    </div>
+    <div id="codes-body" aria-live="polite"></div>
+  </section>
+
+  <section id="view-info" class="view" aria-labelledby="info-h" hidden>
+    <div class="view-head">
+      <h2 id="info-h">Car info</h2>
+      <button type="button" class="btn" id="info-btn">Read again</button>
+    </div>
+    <div id="info-body" aria-live="polite"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
