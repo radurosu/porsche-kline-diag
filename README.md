@@ -2,9 +2,33 @@
 
 Open, modern diagnostics for K-line era water-cooled Porsches
 (986 Boxster, 996, 997.1, 987.1, Cayenne 955 — roughly 1997–2008).
-Status: **talks to a real car.** On a 2002 996 (Bosch ME7.8): live data over generic
-OBD (21 readings, incl. readiness), DME identification and fault codes over KWP2000, and
-the DME's raw Porsche data blocks. Over-rev counters aren't decoded yet. Read-only by design.
+Status: **tested and improved on a real 2002 Porsche 911 (996).** Live data, fault codes,
+identification and the DME's raw Porsche data blocks work. Over-rev counters aren't
+decoded yet. Read-only by design.
+
+## Tested on a real car
+
+| | |
+|---|---|
+| Car | 2002 Porsche 911 (996) Targa, US spec, Bosch ME7.8 engine computer |
+| Cable | KKL 409.1 USB cable, FTDI FT232RL, Apple's built-in driver |
+| Computer | macOS, Python 3.12 |
+| Date | 2026-10-15 |
+
+What works on that car:
+- **Generic OBD** over ISO 9141-2: all 21 readings it reports, live, including fault-lamp
+  status and readiness monitors. About 7 requests/s, so the tach needle updates ~3.5 times a second.
+- **Engine computer (DME)** over KWP2000 at address 0x11: identification, stored fault
+  codes, and its 14 Porsche-specific data blocks, shown and logged raw.
+- **Web UI** on the car: live tach, every reading, Porsche data tab, all logged to `logs/`.
+
+What the car test changed in the code: pyserial was reprogramming the serial port on
+every read and corrupting bytes (fixed), the real DME address and fault-code request
+replaced earlier guesses, and timing margins now match measured ECU and USB behaviour.
+Details in [docs/PROTOCOL.md](docs/PROTOCOL.md) (Findings) and [docs/HARDWARE.md](docs/HARDWARE.md).
+
+Not tested yet: other models and years (986, 997.1, 987.1, 955), and anything that needs
+the over-rev counters decoded.
 
 ## Setup (macOS)
 
