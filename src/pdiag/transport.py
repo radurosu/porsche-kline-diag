@@ -70,13 +70,20 @@ class SerialTransport:
             t += 0.2
             _sleep_until(t)
         s.break_condition = False  # stop bit; line high, ECU may answer during it
-        # The low phases put 0x00/framing junk into RX; drop it before the sync.
+        # The low phases put 0x00/framing junk into RX. Some of it can still be
+        # in the FTDI chip (latency timer) when we reset, so skip junk until 0x55.
         s.reset_input_buffer()
 
-        sync = self.read(1, 0.2 + 0.3)  # stop bit + W1 max
-        if sync != b"\x55":
+        junk = bytearray()
+        deadline = time.perf_counter() + 0.2 + 0.3  # stop bit + W1 max
+        while (rem := deadline - time.perf_counter()) > 0:
+            b = self.read(1, rem)
+            if b == b"\x55":
+                break
+            junk += b
+        else:
             raise KLineError(f"no 0x55 sync after 5-baud 0x{address:02X} "
-                             f"(got {sync.hex() or 'nothing'})")
+                             f"(got {junk.hex() or 'nothing'})")
         kb = self.read(2, 0.1)
         if len(kb) != 2:
             raise KLineError(f"keybytes incomplete: {kb.hex()}")
@@ -101,15 +108,19 @@ class SerialTransport:
         _sleep_until(t + 0.050)
 
     def write(self, data: bytes) -> None:
+        # Send the whole frame paced by P4, then check the echo. Waiting for each
+        # echo byte before sending the next adds the FTDI latency timer (often
+        # 16 ms) to every gap and breaks P4max (20 ms).
         for i, b in enumerate(data):
             self.ser.write(bytes([b]))
-            if self.echo:
-                e = self.read(1, 0.05)
-                if e != bytes([b]):
-                    raise KLineError(f"echo mismatch at byte {i}: sent {b:02x}, "
-                                     f"got {e.hex() or 'nothing'} (collision?)")
             if self.p4 and i < len(data) - 1:
                 time.sleep(self.p4)
+        if self.echo:
+            e = self.read(len(data), 0.1 + len(data) * 0.002)
+            if e != data:
+                i = next((i for i, (a, b) in enumerate(zip(data, e)) if a != b), len(e))
+                raise KLineError(f"echo mismatch at byte {i}: sent {data.hex()}, "
+                                 f"got {e.hex() or 'nothing'} (collision?)")
 
     def read(self, n: int, timeout: float) -> bytes:
         buf = bytearray()

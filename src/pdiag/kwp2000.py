@@ -18,6 +18,8 @@ P2_TIMEOUT = 1.0  # spec P2max is 50 ms; generous until real ECU timing is known
 P2_PENDING = 5.0  # after NRC 0x78 (response pending)
 P3_MIN = 0.055  # min gap between ECU response and next request
 P1_INTERBYTE = 0.05
+REQUEST_DEADLINE = 30.0  # total per request, incl. responsePending extensions
+MULTI_GAP = 0.1  # after a reply, wait this long for other ECUs (functional requests)
 
 NRC = {
     0x10: "generalReject",
@@ -89,19 +91,46 @@ def decode(raw: bytes) -> Frame:
     return Frame(tgt, src, raw[i:-1])
 
 
-def split_frames(raw: bytes) -> list[Frame]:
-    """Best-effort split of a captured byte stream into KWP frames (for sniffing)."""
-    out, i = [], 0
-    while i < len(raw):
-        size = frame_size(raw[i:i + 5])
-        if size is None or i + size > len(raw):
-            break
+def split_stream(raw: bytes) -> tuple[list[Frame], bytes, bytes]:
+    """Best-effort split of captured bytes into KWP frames (for sniffing).
+
+    Returns (frames, skipped, rest). Bytes that don't start a valid frame (init
+    sync/keybytes, noise) are skipped one at a time; `rest` is a trailing partial
+    frame to prepend to the next chunk. A skipped byte can occasionally line up
+    into a false frame, so the raw capture stays the ground truth.
+    """
+    def valid_at(j: int) -> bool:
+        size = frame_size(raw[j:j + 5])
+        if size is None or j + size > len(raw):
+            return False
         try:
-            out.append(decode(raw[i:i + size]))
+            decode(raw[j:j + size])
+            return True
         except KLineError:
+            return False
+
+    out, skipped, i = [], bytearray(), 0
+    while i < len(raw):
+        if valid_at(i):
+            size = frame_size(raw[i:i + 5])
+            out.append(decode(raw[i:i + size]))
+            i += size
+            continue
+        # Either junk or a frame still arriving. If a valid frame starts later
+        # in the buffer, this byte was junk; otherwise keep the tail for later.
+        if not any(valid_at(j) for j in range(i + 1, len(raw))):
             break
-        i += size
-    return out
+        skipped.append(raw[i])
+        i += 1
+    return out, bytes(skipped), raw[i:]
+
+
+def split_frames(raw: bytes) -> list[Frame]:
+    return split_stream(raw)[0]
+
+
+class NoResponse(KLineError):
+    pass
 
 
 class NegativeResponse(KLineError):
@@ -114,7 +143,7 @@ class NegativeResponse(KLineError):
 def read_frame(t: Transport, timeout: float) -> Frame:
     head = t.read(1, timeout)
     if not head:
-        raise KLineError("timeout waiting for ECU response")
+        raise NoResponse("timeout waiting for ECU response")
     while (size := frame_size(head)) is None:
         b = t.read(1, P1_INTERBYTE)
         if not b:
@@ -143,30 +172,64 @@ class Kwp2000Client:
     def connect_fast(self) -> tuple[int, int]:
         self.t.fast_init()
         resp = self.request(b"\x81")  # StartCommunication
-        self.keybytes = (resp[1], resp[2]) if len(resp) >= 3 else None
+        if len(resp) < 3:
+            raise KLineError(f"StartCommunication reply without keybytes: {resp.hex()}")
+        self.keybytes = (resp[1], resp[2])
         return self.keybytes
 
     # -- core request/response --------------------------------------------
     def request(self, data: bytes) -> bytes:
         """Send a request, return positive response data (incl. SID+0x40)."""
+        return self._exchange(data, multi=False)[0]
+
+    def request_all(self, data: bytes) -> list[bytes]:
+        """For functional requests that several ECUs answer (e.g. DME and a
+        Tiptronic TCU): every positive response, in arrival order. A negative
+        response from one ECU is raised only if no ECU answered positively."""
+        return self._exchange(data, multi=True)
+
+    def _exchange(self, data: bytes, multi: bool) -> list[bytes]:
         sid = data[0]
         wait = self._last_rx + getattr(self.t, "p3", P3_MIN) - time.perf_counter()
         if wait > 0:
             time.sleep(wait)
         self.t.write(encode(data, self.target, self.source, self.functional))
+        out: list[bytes] = []
+        nrc: NegativeResponse | None = None
+        pending: set[int | None] = set()  # ECUs that sent 0x78 and owe a final reply
         timeout = P2_TIMEOUT
+        deadline = time.perf_counter() + REQUEST_DEADLINE
         while True:
-            f = read_frame(self.t, timeout)
+            if time.perf_counter() > deadline:
+                raise KLineError(f"no final response to service 0x{sid:02X} "
+                                 f"within {REQUEST_DEADLINE:.0f} s")
+            try:
+                f = read_frame(self.t, timeout)
+            except NoResponse:
+                if out:
+                    return out
+                if nrc:
+                    raise nrc
+                raise
             self._last_rx = time.perf_counter()
             d = f.data
             if len(d) >= 3 and d[0] == 0x7F and d[1] == sid:
                 if d[2] == 0x78:
+                    pending.add(f.source)
                     timeout = P2_PENDING
                     continue
-                raise NegativeResponse(sid, d[2])
-            if d and d[0] == sid + 0x40:
-                return d
-            # frame not for this request (other ECU / stale); keep listening
+                pending.discard(f.source)
+                nrc = NegativeResponse(sid, d[2])
+                if not multi:
+                    raise nrc
+            elif d and d[0] == sid + 0x40:
+                pending.discard(f.source)
+                out.append(d)
+                if not multi:
+                    return out
+            else:
+                continue  # frame not for this request (other ECU / stale)
+            timeout = P2_PENDING if pending else MULTI_GAP
 
     # -- read-only services ------------------------------------------------
     def start_session(self, mode: int = 0x81) -> bytes:
@@ -184,10 +247,11 @@ class Kwp2000Client:
     def read_dtcs(self, status: int = 0x02, group: int = 0xFF00) -> list[tuple[int, int]]:
         """readDTCByStatus -> [(dtc16, status)]."""
         d = self.request(bytes([0x18, status, group >> 8, group & 0xFF]))
-        count = d[1]
-        body = d[2:]
+        if len(d) < 2 or len(d) - 2 < d[1] * 3:
+            raise KLineError(f"DTC reply shorter than its count: {d.hex()}")
+        count, body = d[1], d[2:]
         return [((body[i] << 8) | body[i + 1], body[i + 2])
-                for i in range(0, min(len(body), count * 3), 3)]
+                for i in range(0, count * 3, 3)]
 
     def stop(self) -> None:
         try:

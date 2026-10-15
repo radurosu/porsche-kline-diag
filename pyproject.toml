@@ -1,7 +1,7 @@
 [project]
 name = "pdiag"
 version = "0.0.1"
-description = "Open diagnostics for K-line era water-cooled Porsches (986/996/997.1)"
+description = "Open diagnostics for K-line era water-cooled Porsches (986/996/987.1/997.1)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.11"

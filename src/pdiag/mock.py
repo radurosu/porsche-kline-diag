@@ -1,4 +1,4 @@
-"""Simulated 996 for development without the car.
+"""Simulated car (996 or 987 etc.) for development without the car.
 
 All values here are FAKE placeholders, not decoded Porsche data. Real local
 IDs / ECU ID formats must come from captures (see docs/PROTOCOL.md).
@@ -11,23 +11,32 @@ import random
 import time
 
 from . import kwp2000
+from .models import DEFAULT, Model
 from .transport import KLineError, QueueTransport
 
-MOCK_DME_ADDR = 0x10  # placeholder; real 996 DME address unverified
+MOCK_DME_ADDR = 0x10  # placeholder; real DME address unverified
+MOCK_TCU_ADDR = 0x18  # placeholder for a second ECU on the bus (Tiptronic)
 
-# Over-rev counters as the UI expects them once decoded. Range boundaries are
-# PLACEHOLDERS (not verified ME7.8 values); counts and hours are invented.
-MOCK_OVER_REV = {
-    "engine_hours": 3412.6,
-    "ranges": [
-        {"range": 1, "rpm_from": 7300, "rpm_to": 7600, "ignitions": 1284, "last_hour": 3409.1},
-        {"range": 2, "rpm_from": 7600, "rpm_to": 7900, "ignitions": 412, "last_hour": 3402.7},
-        {"range": 3, "rpm_from": 7900, "rpm_to": 8200, "ignitions": 3, "last_hour": 2113.5},
-        {"range": 4, "rpm_from": 8200, "rpm_to": 8500, "ignitions": 0, "last_hour": None},
-        {"range": 5, "rpm_from": 8500, "rpm_to": 8800, "ignitions": 0, "last_hour": None},
-        {"range": 6, "rpm_from": 8800, "rpm_to": None, "ignitions": 0, "last_hour": None},
-    ],
-}
+# Fake VINs: right WMI / type / year positions so model detection works,
+# "MOCK" in the serial so they can't be mistaken for real cars.
+MOCK_VINS = {"986": "WP0ZZZ98Z1SMOCK00", "996": "WP0ZZZ99Z2SMOCK00",
+             "987": "WP0ZZZ98Z6UMOCK00", "997": "WP0ZZZ99Z7SMOCK00"}
+
+# Counts and hours are invented. Boundaries come from the model profile, which
+# are PLACEHOLDERS too.
+_MOCK_COUNTS = [(1284, 3409.1), (412, 3402.7), (3, 2113.5), (0, None), (0, None), (0, None)]
+
+
+def mock_over_rev(model: Model = DEFAULT) -> dict:
+    """Over-rev counters as the UI expects them once decoded."""
+    b = model.over_rev_from
+    return {
+        "engine_hours": 3412.6,
+        "ranges": [{"range": i + 1, "rpm_from": b[i],
+                    "rpm_to": b[i + 1] if i + 1 < len(b) else None,
+                    "ignitions": n, "last_hour": h}
+                   for i, (n, h) in enumerate(_MOCK_COUNTS)],
+    }
 
 # Text for the mock's DTCs only. P1128 wording is approximate.
 MOCK_DTC_TEXT = {
@@ -66,12 +75,14 @@ def _engine(t: float) -> dict[str, float]:
 
 class MockCar(QueueTransport):
     def __init__(self, generic: str = "iso9141", dme_addr: int = MOCK_DME_ADDR,
-                 dynamic: bool = False):
+                 dynamic: bool = False, model: str = "996", tcu: bool = False):
         super().__init__()
         self.generic = generic
         self.dme_addr = dme_addr
         self.addr: int | None = None
         self.dynamic = dynamic  # False = fixed idle values (tests)
+        self.vin = MOCK_VINS[model].encode()
+        self.tcu = tcu  # a second ECU also answers generic OBD (answers first)
         self.t0 = time.monotonic()
 
     # -- wakeup ------------------------------------------------------------
@@ -90,16 +101,38 @@ class MockCar(QueueTransport):
     # -- requests ----------------------------------------------------------
     def write(self, data: bytes) -> None:
         if data[0] == 0x68:  # ISO 9141-2 request
-            resp = self._obd(data[3:-1])
-            if resp:
-                body = bytes([0x48, 0x6B, self.dme_addr]) + resp
+            for src, resp in self._obd_all(data[3:-1]):
+                if resp[0] == 0x7F:
+                    continue  # ISO 9141-2 ECUs stay silent instead
+                body = bytes([0x48, 0x6B, src]) + resp
                 self.push(body + bytes([kwp2000.checksum(body)]))
             return
         f = kwp2000.decode(data)
         if f.data[0] == 0x81:
             self.addr = f.target
-        for resp in self._kwp(f.target, f.data):
-            self.push(kwp2000.encode(resp, kwp2000.TESTER, f.target))
+        if f.target == 0x33:
+            replies = self._obd_all(f.data)
+        else:
+            replies = [(f.target, r) for r in self._kwp(f.data)]
+        for src, resp in replies:
+            self.push(kwp2000.encode(resp, kwp2000.TESTER, src))
+
+    def _obd_all(self, d: bytes) -> list[tuple[int, bytes]]:
+        out = []
+        if self.tcu:
+            out.append((MOCK_TCU_ADDR, self._tcu_obd(d)))
+        r = self._obd(d)
+        out.append((self.dme_addr, r or bytes([0x7F, d[0], 0x12])))
+        return out
+
+    def _tcu_obd(self, d: bytes) -> bytes:
+        if d == b"\x01\x00":
+            return b"\x41\x00\x00\x08\x00\x00"  # PID 0D only
+        if d == b"\x01\x0d":
+            return b"\x41\x0d\x00"
+        if d[0] == 0x03:
+            return b"\x43" + bytes(6)
+        return bytes([0x7F, d[0], 0x12])
 
     def _obd(self, d: bytes) -> bytes | None:
         if d[0] == 0x01:
@@ -130,11 +163,8 @@ class MockCar(QueueTransport):
             0x10: round(e["maf"] * 100).to_bytes(2, "big"), 0x11: pct(e["throttle"]),
         }
 
-    def _kwp(self, target: int, d: bytes) -> list[bytes]:
+    def _kwp(self, d: bytes) -> list[bytes]:
         sid = d[0]
-        if target == 0x33:
-            r = self._obd(d)
-            return [r] if r else [bytes([0x7F, sid, 0x11])]
         if sid == 0x81:
             return [b"\xC1\xEF\x8F"]
         if sid == 0x10:
@@ -144,7 +174,7 @@ class MockCar(QueueTransport):
         if sid == 0x82:
             return [b"\xC2"]
         if sid == 0x1A:
-            ids = {0x9B: b"MOCK-ME7.8 0261 FAKE", 0x90: b"WP0ZZZ99Z2SMOCK00"}
+            ids = {0x9B: b"MOCK-ME7.8 0261 FAKE", 0x90: self.vin}
             if d[1] in ids:
                 return [bytes([0x5A, d[1]]) + ids[d[1]]]
             return [bytes([0x7F, sid, 0x31])]

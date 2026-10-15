@@ -56,6 +56,18 @@ Location and encoding are **unknown**. Plan:
 2. Fallback: `pdiag lid-scan`, correlate responses with known engine state.
 3. Fallback: memory read (`0x23`, read-only) if the ECU permits it.
 
+## Models
+`src/pdiag/models.py`. Model is detected from the VIN (public layout): WMI `WP0`, positions
+7-8 `98` = Boxster/Cayman, `99` = 911, position 10 = model year. 98 + ≤2004 → 986,
+98 + 2005–08 → 987.1, 99 + ≤2004 → 996, 99 + 2005–08 → 997.1. MY2005 `99` is ambiguous
+(996 Turbo/GT2/GT3 overlap) → `--model 996`. MY2009+ (987.2/997.2) is out of scope.
+Per-model DME address, redline and over-rev boundaries are **placeholders**, identical for
+all models until a capture of each says otherwise.
+
+987.1 / 997.1 risk: US law required CAN (ISO 15765-4) for generic OBD from MY2008. A US
+MY2008 car may answer generic OBD (`pdiag obd`, Live view) only on CAN, which a KKL cable
+can't reach, even if its DME still talks K-line. Unverified; first 987 trace settles it.
+
 ## Findings
 | Date | Item | Value | Source |
 |---|---|---|---|

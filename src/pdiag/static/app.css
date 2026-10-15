@@ -163,6 +163,19 @@ table.ranges { width: 100%; border-collapse: collapse; }
   background: var(--paper-2); font-size: 14px; max-width: 70ch;
 }
 
+/* Colophon: quiet, one hairline, the maker's name the only emphasis */
+.colophon {
+  display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px 24px;
+  max-width: 1180px; margin: 24px auto 0; padding: 18px 32px 40px;
+  border-top: 1px solid var(--rule); font-size: 13px; color: var(--ink-2);
+}
+.colophon p { margin: 0; }
+.colophon a {
+  color: var(--ink); font-weight: 600; font-stretch: var(--wide); letter-spacing: 0.01em;
+  text-decoration: none; border-bottom: 1px solid transparent;
+}
+.colophon a:hover { border-bottom-color: var(--needle); }
+
 /* Codes */
 .codes { list-style: none; margin: 0; padding: 0; }
 .codes li { display: grid; grid-template-columns: 9rem 1fr; gap: 8px 24px; padding: 18px 0; border-top: 1px solid var(--rule); }
@@ -201,6 +214,7 @@ dl.info { display: grid; grid-template-columns: max-content 1fr; gap: 0; margin:
   .link-state { text-align: left; }
   .tabs { padding: 0 16px; gap: 22px; }
   main { padding: 24px 16px; }
+  .colophon { padding: 16px 16px 32px; }
   .codes li { grid-template-columns: 1fr; }
   .ranges .count { width: auto; }
   .ranges .when-full { display: none; }
@@ -220,4 +234,8 @@ dl.info { display: grid; grid-template-columns: max-content 1fr; gap: 0; margin:
   #view-report { display: block !important; }
   main, .masthead { padding: 0; max-width: none; }
   .masthead { margin-bottom: 24px; }
+  .colophon { padding: 12px 0 0; margin-top: 32px; }
 }
+
+/* Stream lost: readings are old, not current. */
+.live.stale .ro-value, .live.stale .spark, .live.stale figcaption, .live.stale .t-needle { opacity: 0.35; }

@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import kwp2000, obd
+from . import kwp2000, models, obd
 from .transport import KLineError, SerialTransport, TracingTransport
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
@@ -26,7 +26,8 @@ def _hexlist(s: str) -> list[int]:
 def open_transport(args, cmd: str):
     if args.mock:
         from .mock import MockCar
-        t = MockCar(generic=args.mock_generic, dynamic=cmd == "ui")
+        t = MockCar(generic=args.mock_generic, dynamic=cmd == "ui",
+                    model=args.model or "996")
     else:
         port = args.port or os.environ.get("PDIAG_PORT") or _guess_port()
         t = SerialTransport(port)
@@ -69,14 +70,24 @@ def cmd_ports(args):
 
 
 def cmd_probe(args, t):
+    from .service import SESSION_TIMEOUT
+    inits = ["5baud", "fast"] if args.init == "both" else [args.init]
     for a in args.addrs:
-        try:
-            kb = t.five_baud_init(a)
-            print(f"0x{a:02X}: keybytes {kb[0]:02X} {kb[1]:02X}"
-                  + ("  (KWP2000)" if kb[1] == kwp2000.KWP_KB2 else ""))
-        except KLineError as e:
-            print(f"0x{a:02X}: {e}")
-        time.sleep(0 if args.mock else 2.5)  # let previous ECU time out (P3max)
+        for init in inits:
+            try:
+                if init == "5baud":
+                    kb = t.five_baud_init(a)
+                else:
+                    kb = kwp2000.Kwp2000Client(t, a, functional=a == obd.OBD_ADDR).connect_fast()
+                print(f"0x{a:02X} {init}: keybytes {kb[0]:02X} {kb[1]:02X}"
+                      + ("  (KWP2000)" if kb[1] == kwp2000.KWP_KB2 else ""))
+                awake = True
+            except KLineError as e:
+                print(f"0x{a:02X} {init}: {e}")
+                awake = False
+            if not args.mock:
+                # An ECU that woke stays in session until P3max passes.
+                time.sleep(SESSION_TIMEOUT if awake else 0.5)
 
 
 def cmd_obd(args, t):
@@ -153,6 +164,7 @@ def cmd_sniff(args, t):
     out = LOG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-sniff.jsonl"
     print(f"sniffing -> {out} (Ctrl-C to stop)")
     t0 = time.perf_counter()
+    rest = b""  # partial frame carried into the next chunk
     with open(out, "w") as f:
         try:
             while True:
@@ -160,10 +172,14 @@ def cmd_sniff(args, t):
                 if not chunk:
                     continue
                 rec = {"t": round(time.perf_counter() - t0, 4), "hex": chunk.hex()}
-                frames = kwp2000.split_frames(chunk)
+                frames, skipped, rest = kwp2000.split_stream(rest + chunk)
+                if len(rest) > 260:  # longer than any KWP frame: not a frame start
+                    skipped, rest = skipped + rest, b""
                 if frames:
                     rec["kwp"] = [{"tgt": fr.target, "src": fr.source,
                                    "data": fr.data.hex()} for fr in frames]
+                if skipped:
+                    rec["skipped"] = skipped.hex()
                 f.write(json.dumps(rec) + "\n")
                 print(rec["t"], chunk.hex(" "))
         except KeyboardInterrupt:
@@ -174,7 +190,8 @@ def cmd_ui(args, t):
     from .service import Car
     from .web import serve
     port = None if args.mock else getattr(getattr(t, "inner", t), "ser", None).port
-    serve(Car(t, dme_addr=args.addr, mock=args.mock, port=port, name=args.car),
+    model = models.MODELS[args.model] if args.model else None
+    serve(Car(t, model=model, dme_addr=args.addr, mock=args.mock, port=port, label=args.car),
           port=args.http_port, open_browser=not args.no_browser)
 
 
@@ -185,12 +202,15 @@ def main(argv=None):
     ap.add_argument("--mock-generic", choices=["iso9141", "kwp"], default="iso9141",
                     help="generic OBD protocol the simulated car speaks")
     ap.add_argument("--no-trace", action="store_true")
+    ap.add_argument("--model", choices=sorted(models.MODELS),
+                    help="car model (default: detect from the VIN; the mock simulates a 996)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("ports", help="list serial ports")
 
     p = sub.add_parser("probe", help="5-baud init a list of addresses")
     p.add_argument("--addrs", type=_hexlist, default=[0x33, 0x10, 0x11, 0x01, 0x12])
+    p.add_argument("--init", choices=["5baud", "fast", "both"], default="5baud")
 
     for name in ("obd", "live"):
         p = sub.add_parser(name, help="generic OBD summary" if name == "obd"
@@ -217,8 +237,9 @@ def main(argv=None):
             p.add_argument("--end", type=_parse_int, default=0xFF)
 
     p = sub.add_parser("ui", help="open the local web interface")
-    p.add_argument("--addr", type=_parse_int, default=0x10, help="DME K-line address")
-    p.add_argument("--car", default="996 Targa", help="name shown in the header")
+    p.add_argument("--addr", type=_parse_int, default=None,
+                   help="DME K-line address (default: the model's, unverified 0x10)")
+    p.add_argument("--car", default=None, help="name shown in the header, e.g. '996 Targa'")
     p.add_argument("--http-port", type=int, default=8996)
     p.add_argument("--no-browser", action="store_true")
 

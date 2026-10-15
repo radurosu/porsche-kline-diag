@@ -37,6 +37,8 @@ def make_handler(car: Car):
                 self._json(501, {"error": str(e), "kind": "not_decoded"})
             except KLineError as e:
                 self._json(502, {"error": str(e), "kind": "kline"})
+            except Exception as e:  # keep the UI informed instead of dropping the socket
+                self._json(500, {"error": f"{type(e).__name__}: {e}", "kind": "internal"})
 
         def do_GET(self):
             path = self.path.split("?")[0]

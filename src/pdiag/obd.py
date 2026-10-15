@@ -25,7 +25,7 @@ class Iso9141Link:
 
     def __init__(self, t: Transport):
         self.t = t
-        self._last = 0.0
+        self._last = time.perf_counter()  # created right after the handshake: wait P3
 
     def request(self, data: bytes) -> list[bytes]:
         wait = self._last + getattr(self.t, "p3", kwp2000.P3_MIN) - time.perf_counter()
@@ -34,13 +34,19 @@ class Iso9141Link:
         body = bytes([0x68, 0x6A, 0xF1]) + data
         self.t.write(body + bytes([kwp2000.checksum(body)]))
         out = []
+        pend = b""
         first = 0.5
-        while msg := self.t.read_until_gap(gap=0.022, first_timeout=first):
+        while chunk := self.t.read_until_gap(gap=0.022, first_timeout=first):
             first = 0.1
-            if len(msg) < 5 or kwp2000.checksum(msg[:-1]) != msg[-1]:
-                raise KLineError(f"bad ISO 9141 response: {msg.hex()}")
-            out.append(msg[3:-1])
+            # USB latency can split one message over two chunks: keep
+            # accumulating until the checksum closes.
+            pend += chunk
+            if len(pend) >= 5 and kwp2000.checksum(pend[:-1]) == pend[-1]:
+                out.append(pend[3:-1])
+                pend = b""
         self._last = time.perf_counter()
+        if pend:
+            raise KLineError(f"bad ISO 9141 response: {pend.hex()}")
         if not out:
             raise KLineError("no OBD response")
         return out
@@ -53,7 +59,7 @@ class KwpObdLink:
         self.client = client
 
     def request(self, data: bytes) -> list[bytes]:
-        return [self.client.request(data)]
+        return self.client.request_all(data)
 
 
 def connect(t: Transport, init: str = "auto"):
@@ -68,6 +74,7 @@ def connect(t: Transport, init: str = "auto"):
             if kb[1] == kwp2000.KWP_KB2:
                 c = kwp2000.Kwp2000Client(t, OBD_ADDR, functional=True)
                 c.keybytes = kb
+                c._last_rx = time.perf_counter()  # wait P3 before the first request
                 return KwpObdLink(c), kb
             return Iso9141Link(t), kb  # keybytes 08 08 or 94 94
     c = kwp2000.Kwp2000Client(t, OBD_ADDR, functional=True)
@@ -107,25 +114,31 @@ PIDS = {p.pid: p for p in [
 
 
 def supported_pids(link) -> list[int]:
-    """Walk the 0x00/0x20/0x40... bitmaps."""
-    out, base = [], 0x00
+    """Walk the 0x00/0x20/0x40... bitmaps, merged across every ECU that answers."""
+    out, base = set(), 0x00
     while True:
         try:
-            resp = link.request(bytes([0x01, base]))[0]
+            resps = link.request(bytes([0x01, base]))
         except KLineError:
             break
-        bits = int.from_bytes(resp[2:6], "big")
-        out += [base + i + 1 for i in range(32) if bits & (1 << (31 - i))]
-        if not bits & 1 or base >= 0xC0:
+        more = False
+        for resp in resps:
+            if len(resp) < 6 or resp[:2] != bytes([0x41, base]):
+                continue
+            bits = int.from_bytes(resp[2:6], "big")
+            out |= {base + i + 1 for i in range(32) if bits & (1 << (31 - i))}
+            more |= bool(bits & 1)
+        if not more or base >= 0xC0:
             break
         base += 0x20
-    return [p for p in out if p % 0x20]
+    return sorted(p for p in out if p % 0x20)
 
 
 def read_pid(link, pid: int) -> tuple[float, bytes]:
-    resp = link.request(bytes([0x01, pid]))[0]
-    if resp[0] != 0x41 or resp[1] != pid:
-        raise KLineError(f"unexpected PID response: {resp.hex()}")
+    resps = link.request(bytes([0x01, pid]))
+    resp = next((r for r in resps if len(r) > 2 and r[0] == 0x41 and r[1] == pid), None)
+    if resp is None:
+        raise KLineError(f"unexpected PID response: {' '.join(r.hex() for r in resps)}")
     raw = resp[2:]
     p = PIDS.get(pid)
     return (p.decode(raw) if p else float("nan")), raw
@@ -139,7 +152,12 @@ def dtc_str(code: int) -> str:
 def read_stored_dtcs(link) -> list[str]:
     """Mode 03. Payload 43 then 2-byte DTCs, zero-padded."""
     codes = []
-    for resp in link.request(b"\x03"):
+    resps = link.request(b"\x03")
+    if not any(r and r[0] == 0x43 for r in resps):
+        raise KLineError(f"mode 03 rejected: {' '.join(r.hex() for r in resps)}")
+    for resp in resps:
+        if not resp or resp[0] != 0x43:
+            continue
         body = resp[1:]
         if len(body) % 2:  # some stacks prepend a count byte
             body = body[1:]

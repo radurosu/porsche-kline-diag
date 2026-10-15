@@ -2,7 +2,9 @@
 
 const $ = (s) => document.querySelector(s);
 const MAX_RPM = 9000;
-const REDLINE = 7300;
+// Both come from the car's model profile (/api/status); these are fallbacks.
+let REDLINE = 7200;
+let RANGE_FROM = [7300, 7600, 7900, 8200, 8500, 8800];
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const NS = "http://www.w3.org/2000/svg";
 
@@ -53,11 +55,21 @@ function severity(range, count) {
   return range === 3 ? "caution" : "serious";
 }
 
-const DEFAULT_RANGES = [7300, 7600, 7900, 8200, 8500, 8800].map((f, i, a) => ({
-  range: i + 1, rpm_from: f, rpm_to: a[i + 1] ?? null, ignitions: 0,
+const defaultRanges = () => RANGE_FROM.map((f, i, a) => ({
+  range: i + 1, rpm_from: f, rpm_to: a[i + 1] ?? null, ignitions: null,  // not read
 }));
 
+function applyProfile() {
+  const p = status?.profile;
+  if (!p) return;
+  if (p.redline === REDLINE && String(p.over_rev_from) === String(RANGE_FROM)) return;
+  REDLINE = p.redline;
+  RANGE_FROM = p.over_rev_from;
+  buildTach();
+}
+
 let needle, redArc;
+let targetRpm = 0, shownRpm = 0;
 
 function buildTach() {
   const s = $("#tach");
@@ -82,12 +94,12 @@ function buildTach() {
   x.textContent = "×1000 rpm";
 
   const bands = svg("g", { id: "bands" }, s);
-  drawBands(bands, overRev?.ranges ?? DEFAULT_RANGES);
+  drawBands(bands, overRev?.ranges ?? defaultRanges());
 
   needle = svg("g", {}, s);
   svg("line", { x1: CX, y1: CY + 26, x2: CX, y2: CY - 150, class: "t-needle" }, needle);
   svg("circle", { cx: CX, cy: CY, r: 13, class: "t-hub" }, s);
-  setNeedle(0);
+  setNeedle(shownRpm);
 }
 
 function drawBands(g, ranges) {
@@ -97,7 +109,8 @@ function drawBands(g, ranges) {
     const sev = severity(r.range, r.ignitions);
     const p = svg("path", { d: sector(169, 187, r.rpm_from + 15, to - 15), class: "t-band", "data-sev": sev }, g);
     const title = svg("title", {}, p);
-    title.textContent = `Range ${r.range}: ${fmt(r.ignitions)} ignitions`;
+    title.textContent = r.ignitions == null ? `Range ${r.range}: not read yet`
+      : `Range ${r.range}: ${fmt(r.ignitions)} ignitions`;
     const [tx, ty] = pt((r.rpm_from + to) / 2, 178);
     const t = svg("text", { x: tx, y: ty + 4, "text-anchor": "middle", class: "t-band-num", "data-sev": sev }, g);
     t.textContent = r.range;
@@ -110,7 +123,6 @@ function setNeedle(rpm) {
   redArc.classList.toggle("hot", rpm >= REDLINE - 150);
 }
 
-let targetRpm = 0, shownRpm = 0;
 function animate() {
   shownRpm = reduceMotion ? targetRpm : shownRpm + (targetRpm - shownRpm) * 0.3;
   setNeedle(shownRpm);
@@ -170,17 +182,27 @@ let es = null;
 function startLive() {
   if (es) return;
   es = new EventSource("/api/live");
+  es.onerror = () => {
+    // EventSource reconnects by itself; until then the numbers are old.
+    setLink("err", "<strong>Lost contact with pdiag.</strong> Reconnecting.");
+    setStale(true);
+  };
   es.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.error) {
       setLink("err", `<strong>No answer from the car.</strong> Retrying.`);
+      setStale(true);
       return;
     }
+    setStale(false);
     if (status) renderLink();
     targetRpm = msg.values.rpm;
     $("#rpm-num").textContent = fmt(Math.round(targetRpm / 10) * 10);
     updateReadouts(msg.values);
   };
+}
+function setStale(on) {
+  $(".live").classList.toggle("stale", on);
 }
 function stopLive() {
   if (es) { es.close(); es = null; }
@@ -201,7 +223,8 @@ function renderLink() {
 const VIN_YEARS = { V: 1997, W: 1998, X: 1999, Y: 2000, 1: 2001, 2: 2002, 3: 2003, 4: 2004, 5: 2005, 6: 2006, 7: 2007, 8: 2008, 9: 2009 };
 
 function renderHeader() {
-  $("#car-name").textContent = status?.car ?? "996";
+  applyProfile();
+  $("#car-name").textContent = status?.car ?? "Porsche";
   const year = ident?.vin && VIN_YEARS[ident.vin[9]];
   const sub = [];
   if (year) sub.push(`${year} model year`);
@@ -247,14 +270,14 @@ function reportHtml(d) {
 
   let sev, headline, sub;
   if (high) {
-    const last = Math.min(...[4, 5, 6].map((i) => ago(by[i])).filter((x) => x != null));
+    const agos = [4, 5, 6].map((i) => ago(by[i])).filter((x) => x != null);
     sev = "serious";
     headline = `${fmt(high)} ignitions recorded in ranges 4 to 6.`;
-    sub = `The most recent was ${fmt(last, 1)} engine hours ago. These usually come from a missed downshift that spins the engine past its limit. Have the valvetrain inspected before buying or tracking this car.`;
+    sub = `${agos.length ? `The most recent was ${fmt(Math.min(...agos), 1)} engine hours ago. ` : ""}These usually come from a missed downshift that spins the engine past its limit. Have the valvetrain inspected before buying or tracking this car.`;
   } else if (r3) {
     sev = "caution";
     headline = `No serious over-revs, but ${fmt(r3)} ignitions in range 3.`;
-    sub = `The last one was ${fmt(ago(by[3]), 1)} engine hours ago. Range 3 is past the rev limiter, so the accelerator alone didn't put the engine there. Ask the owner about it.`;
+    sub = `${ago(by[3]) == null ? "" : `The last one was ${fmt(ago(by[3]), 1)} engine hours ago. `}Range 3 is past the rev limiter, so the accelerator alone didn't put the engine there. Ask the owner about it.`;
   } else {
     sev = "ok";
     headline = "Rev limiter use only. No mechanical over-revs recorded.";

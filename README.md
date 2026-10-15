@@ -23,7 +23,7 @@ See [docs/HARDWARE.md](docs/HARDWARE.md).
 | Command | What |
 |---|---|
 | `pdiag ports` | List serial ports, flag the KKL cable |
-| `pdiag probe [--addrs 33,10,11]` | 5-baud wake each address, print keybytes |
+| `pdiag probe [--addrs 33,10,11] [--init both]` | Wake each address (5-baud and/or fast init), print keybytes |
 | `pdiag obd` | Generic OBD-II: protocol, supported PIDs, values, stored DTCs |
 | `pdiag live [--pids 0C,05,0E]` | Stream PIDs as CSV |
 | `pdiag id --addr 0x10` | DME identification (KWP 0x1A) |
@@ -32,8 +32,8 @@ See [docs/HARDWARE.md](docs/HARDWARE.md).
 | `pdiag ui` | Web UI: live tach, over-rev report, fault codes, car info |
 | `pdiag sniff` | Passive K-line capture (e.g. a Durametric session) |
 
-Global: `--port /dev/cu.usbserial-…` (or `PDIAG_PORT`), `--mock` (+ `--mock-generic kwp`),
-`--no-trace`. Every hardware run writes a byte-level trace to `logs/`.
+Global: `--port /dev/cu.usbserial-…` (or `PDIAG_PORT`), `--model 986|996|987|997` (default: detected
+from the VIN), `--mock` (+ `--mock-generic kwp`; `--model` picks the simulated car), `--no-trace`. Every hardware run writes a byte-level trace to `logs/`.
 
 ## Docs
 
@@ -53,6 +53,10 @@ Scrub VINs from captures before sharing.
 Not affiliated with, endorsed by, or connected to Dr. Ing. h.c. F. Porsche AG, Robert Bosch
 GmbH, or Durametric. Brand names are used only to describe compatibility. pdiag is read-only
 by design, but you use it on your own car at your own risk.
+
+## Credits
+
+pdiag is a project by [Eloquentix](https://eloquentix.com).
 
 ## License
 
