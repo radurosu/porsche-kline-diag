@@ -123,9 +123,17 @@ function setNeedle(rpm) {
   redArc.classList.toggle("hot", rpm >= REDLINE - 150);
 }
 
-function animate() {
-  shownRpm = reduceMotion ? targetRpm : shownRpm + (targetRpm - shownRpm) * 0.3;
+// Readings arrive ~3 times a second. Ease toward each one over about that long, so
+// the needle keeps moving instead of snapping and waiting. Frame-rate independent.
+const NEEDLE_TAU = 0.18;
+let lastFrame = null, shownText = "";
+function animate(now) {
+  const dt = lastFrame == null ? 0 : Math.min(0.1, (now - lastFrame) / 1000);
+  lastFrame = now;
+  shownRpm = reduceMotion ? targetRpm : shownRpm + (targetRpm - shownRpm) * (1 - Math.exp(-dt / NEEDLE_TAU));
   setNeedle(shownRpm);
+  const text = fmt(Math.round(shownRpm / 10) * 10);  // the digits roll with the needle
+  if (text !== shownText) { $("#rpm-num").textContent = text; shownText = text; }
   requestAnimationFrame(animate);
 }
 
@@ -166,10 +174,17 @@ function yOf(r, raw) {
 function updateReadouts(values) {
   for (const r of READOUTS) {
     const raw = values[r.key];
-    if (raw == null) continue;
+    const node = $(`#ro-${r.key}`);
+    if (raw == null) {
+      // Each message is a full snapshot: a missing value isn't known (yet), or
+      // the car stopped reporting it. Don't leave an old number looking live.
+      hist[r.key] = [];
+      node.querySelector(".ro-num").textContent = "–";
+      node.querySelector(".spark").setAttribute("points", "");
+      continue;
+    }
     (hist[r.key] ??= []).push(raw);
     if (hist[r.key].length > HISTORY) hist[r.key].shift();
-    const node = $(`#ro-${r.key}`);
     node.querySelector(".ro-num").textContent = fmt(r.conv ? r.conv(raw) : raw, r.dec);
     const h = hist[r.key];
     const off = HISTORY - h.length;
@@ -177,39 +192,155 @@ function updateReadouts(values) {
   }
 }
 
+// ---------------------------------------------------------------- all readings
+const LABELS = {
+  monitor_status: "Fault lamp and readiness", fuel_system: "Fuel system",
+  rpm: "Engine speed", engine_load: "Engine load", throttle: "Throttle",
+  coolant_temp: "Coolant temperature", intake_temp: "Intake air temperature",
+  maf: "Air flow", timing_advance: "Ignition timing", speed: "Road speed",
+  stft_b1: "Short-term fuel trim, bank 1", ltft_b1: "Long-term fuel trim, bank 1",
+  stft_b2: "Short-term fuel trim, bank 2", ltft_b2: "Long-term fuel trim, bank 2",
+  o2_b1s1: "Oxygen sensor, bank 1 front", o2_b1s2: "Oxygen sensor, bank 1 rear",
+  o2_b2s1: "Oxygen sensor, bank 2 front", o2_b2s2: "Oxygen sensor, bank 2 rear",
+  secondary_air: "Secondary air", o2_sensors: "Oxygen sensors fitted",
+  obd_standard: "OBD standard", map: "Manifold pressure", run_time: "Engine run time",
+};
+const ORDER = Object.keys(LABELS);
+
+function showValue(key, v) {
+  if (v == null) return "–";
+  if (typeof v === "string") return v;
+  const unit = status?.units?.[key] ?? "";
+  if (unit === "C") return units === "us" ? `${fmt(v * 1.8 + 32)} °F` : `${fmt(v)} °C`;
+  if (unit === "km/h") return units === "us" ? `${fmt(v * 0.6214)} mph` : `${fmt(v)} km/h`;
+  const dec = unit === "V" ? 2 : unit === "%" || unit === "g/s" || unit === "deg" ? 1 : 0;
+  return `${fmt(v, dec)}${unit === "deg" ? "°" : unit ? ` ${unit}` : ""}`;
+}
+
+let allKeys = null, lastValues = {};
+function renderAll(values) {
+  lastValues = values;
+  const keys = Object.keys(values).sort((a, b) =>
+    (ORDER.indexOf(a) + 1 || 99) - (ORDER.indexOf(b) + 1 || 99) || a.localeCompare(b));
+  const dl = $("#all");
+  if (keys.join() !== allKeys) {  // a reading appeared or went away: rebuild the rows once
+    allKeys = keys.join();
+    dl.replaceChildren(...keys.flatMap((k) => {
+      const dt = document.createElement("dt");
+      dt.textContent = LABELS[k] ?? k.replaceAll("_", " ");
+      const dd = document.createElement("dd");
+      dd.dataset.key = k;
+      return [dt, dd];
+    }));
+  }
+  for (const dd of dl.querySelectorAll("dd")) {  // otherwise only touch text that changed
+    const text = showValue(dd.dataset.key, values[dd.dataset.key]);
+    if (dd.textContent !== text) dd.textContent = text;
+  }
+}
+
 // ---------------------------------------------------------------- live stream
-let es = null;
+let es = null, liveWanted = false;
 function startLive() {
+  liveWanted = true;
   if (es) return;
   es = new EventSource("/api/live");
-  es.onerror = () => {
-    // EventSource reconnects by itself; until then the numbers are old.
+  es.onerror = (ev) => {
+    // The numbers are old now. Reconnect ourselves every 2 s: the browser's own
+    // retry can back off for a long time after pdiag restarts.
     setLink("err", "<strong>Lost contact with pdiag.</strong> Reconnecting.");
     setStale(true);
+    ev.target.close();
+    if (es === ev.target) es = null;
+    setTimeout(() => { if (liveWanted) startLive(); }, 2000);
   };
   es.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.error) {
-      setLink("err", `<strong>No answer from the car.</strong> Retrying.`);
+      setLink("err", msg.kind === "internal"
+        ? `<strong>pdiag hit an error.</strong> ${esc(msg.error)}`
+        : `<strong>No answer from the car.</strong> Retrying.`);
       setStale(true);
       return;
     }
     setStale(false);
-    if (status) renderLink();
+    if (status) { status.connected = true; renderLink(); }
     targetRpm = msg.values.rpm;
-    $("#rpm-num").textContent = fmt(Math.round(targetRpm / 10) * 10);
     updateReadouts(msg.values);
+    renderAll(msg.values);
   };
 }
 function setStale(on) {
   $(".live").classList.toggle("stale", on);
+  $("#all").classList.toggle("stale", on);
 }
 function stopLive() {
+  liveWanted = false;
   if (es) { es.close(); es = null; }
 }
 
+// ---------------------------------------------------------------- Porsche data blocks
+let dmeEs = null, dmeWanted = false;
+const dmePrev = {}, dmeMoved = {};
+
+function startDme() {
+  dmeWanted = true;
+  if (dmeEs) return;
+  const body = $("#dme-body");
+  if (!body.children.length) body.innerHTML = waiting("Waking the engine computer. This takes a few seconds.");
+  dmeEs = new EventSource("/api/dme-live");
+  dmeEs.onerror = (ev) => {
+    ev.target.close();
+    if (dmeEs === ev.target) dmeEs = null;
+    setTimeout(() => { if (dmeWanted) startDme(); }, 2000);
+  };
+  dmeEs.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.error) {
+      setLink("err", msg.kind === "kline"
+        ? "<strong>No answer from the engine computer.</strong> Retrying."
+        : `<strong>${esc(msg.error)}</strong>`);
+      return;
+    }
+    if (status) { status.connected = true; renderLink(); }
+    renderBlocks(msg.blocks, msg.new);
+  };
+}
+
+function stopDme() {
+  dmeWanted = false;
+  if (dmeEs) { dmeEs.close(); dmeEs = null; }
+}
+
+function renderBlocks(blocks, fresh) {
+  const body = $("#dme-body");
+  if (body.querySelector(".wait")) body.replaceChildren();
+  for (const lid of Object.keys(blocks).sort()) {
+    let el = document.getElementById(`lid-${lid}`);
+    if (!el) {  // first time we see this block: add its row, in order
+      el = document.createElement("div");
+      el.className = "lid";
+      el.id = `lid-${lid}`;
+      el.innerHTML = `<div class="lid-name">Block ${lid.toUpperCase()}<small></small></div><div class="bytes"></div>`;
+      body.insertBefore(el, [...body.children].find((c) => c.id > el.id) ?? null);
+    } else if (lid !== fresh) {
+      continue;  // only the block just read changes
+    }
+    const bytes = blocks[lid].match(/../g) ?? [];
+    const prev = dmePrev[lid], moved = (dmeMoved[lid] ??= new Set()), hot = new Set();
+    if (prev) bytes.forEach((b, i) => { if (prev[i] !== b) { hot.add(i); moved.add(i); } });
+    dmePrev[lid] = bytes;
+    el.querySelector("small").textContent = `${bytes.length} bytes, ${moved.size} moving`;
+    el.querySelector(".bytes").innerHTML = bytes.map((b, i) =>
+      `<span class="${hot.has(i) ? "hot" : moved.has(i) ? "moved" : ""}" title="byte ${i}">${b}</span>`).join("");
+  }
+}
+
 // ---------------------------------------------------------------- header
+let linkNow = "";
 function setLink(state, html) {
+  if (linkNow === state + html) return;
+  linkNow = state + html;
   const n = $("#link-state");
   n.dataset.state = state;
   n.innerHTML = `<span class="lamp" aria-hidden="true"></span><span>${html}</span>`;
@@ -387,7 +518,7 @@ async function loadInfo() {
 
 // ---------------------------------------------------------------- router
 const loaded = {};
-const VIEWS = { live: null, report: loadReport, codes: loadCodes, info: loadInfo };
+const VIEWS = { live: null, report: loadReport, codes: loadCodes, dme: null, info: loadInfo };
 
 function route() {
   const v = location.hash.slice(1) in VIEWS ? location.hash.slice(1) : "live";
@@ -398,6 +529,7 @@ function route() {
   });
   // One K-line session at a time: only stream while Live is open.
   if (v === "live") startLive(); else stopLive();
+  if (v === "dme") startDme(); else stopDme();
   if (VIEWS[v] && !loaded[v]) { loaded[v] = true; VIEWS[v](); }
 }
 
@@ -415,6 +547,7 @@ function unitToggle() {
     label();
     buildReadouts();
     for (const k in hist) hist[k] = [];
+    renderAll(lastValues);
   };
   note.after(b);
 }

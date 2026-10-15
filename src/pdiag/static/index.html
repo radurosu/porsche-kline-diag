@@ -22,6 +22,7 @@
   <a href="#live" data-view="live">Live</a>
   <a href="#report" data-view="report">Over-rev report</a>
   <a href="#codes" data-view="codes">Fault codes</a>
+  <a href="#dme" data-view="dme">Porsche data</a>
   <a href="#info" data-view="info">Car info</a>
 </nav>
 
@@ -38,6 +39,10 @@
       </figure>
       <div class="readouts" id="readouts"></div>
     </div>
+    <section class="all-readings" aria-labelledby="all-h">
+      <h3 id="all-h">Everything the engine computer reports</h3>
+      <dl class="all" id="all"><dt>Waiting for the first readings…</dt><dd></dd></dl>
+    </section>
     <p class="live-note" id="live-note">The colored marks around the dial are the six over-rev ranges. They fill in when the engine has recorded ignitions there.</p>
   </section>
 
@@ -57,6 +62,14 @@
     <div id="codes-body" aria-live="polite"></div>
   </section>
 
+  <section id="view-dme" class="view" aria-labelledby="dme-h" hidden>
+    <div class="view-head">
+      <h2 id="dme-h">Porsche data</h2>
+    </div>
+    <p class="dme-note">Raw data blocks from the engine computer, read one after another. pdiag can't decode them yet. Bytes in ink have changed while you watched, dim ones haven't, and the latest change is amber. Everything is logged.</p>
+    <div id="dme-body"></div>
+  </section>
+
   <section id="view-info" class="view" aria-labelledby="info-h" hidden>
     <div class="view-head">
       <h2 id="info-h">Car info</h2>
@@ -68,7 +81,7 @@
 
 <footer class="colophon">
   <p>pdiag is open source and read-only. It never writes to the car.</p>
-  <p class="maker">A project by <a href="https://eloquentix.com" rel="noopener">Eloquentix</a></p>
+  <p class="maker">A project by <a href="https://eloquentix.com" target="_blank" rel="noopener">Eloquentix</a></p>
 </footer>
 
 <script src="app.js"></script>

@@ -1,7 +1,8 @@
 """Simulated car (996 or 987 etc.) for development without the car.
 
-All values here are FAKE placeholders, not decoded Porsche data. Real local
-IDs / ECU ID formats must come from captures (see docs/PROTOCOL.md).
+Its shape mirrors what a real 2002 996 reported on 2026-10-15: generic OBD over
+ISO 9141-2 (keybytes 08 08), the PID 00 bitmap, the DME at 0x11 (KWP2000, EF 8F)
+and its data block sizes. All values are FAKE placeholders, not decoded data.
 """
 
 from __future__ import annotations
@@ -12,10 +13,14 @@ import time
 
 from . import kwp2000
 from .models import DEFAULT, Model
-from .transport import KLineError, QueueTransport
+from .transport import NoResponse, QueueTransport
 
-MOCK_DME_ADDR = 0x10  # placeholder; real DME address unverified
+MOCK_DME_ADDR = 0x11  # as on a 2002 996 (ME7.8)
 MOCK_TCU_ADDR = 0x18  # placeholder for a second ECU on the bus (Tiptronic)
+
+# Data block sizes a real 2002 996 DME returned (KWP 0x21), 2026-10-15.
+MOCK_LIDS = {0x03: 1, 0x04: 35, 0x05: 35, 0x06: 103, 0x07: 63, 0x08: 70, 0x09: 149,
+             0x0A: 35, 0x0B: 34, 0x0C: 67, 0x14: 4, 0xEA: 3}
 
 # Fake VINs: right WMI / type / year positions so model detection works,
 # "MOCK" in the serial so they can't be mistaken for real cars.
@@ -75,7 +80,8 @@ def _engine(t: float) -> dict[str, float]:
 
 class MockCar(QueueTransport):
     def __init__(self, generic: str = "iso9141", dme_addr: int = MOCK_DME_ADDR,
-                 dynamic: bool = False, model: str = "996", tcu: bool = False):
+                 dynamic: bool = False, model: str = "996", tcu: bool = False,
+                 silent: set[bytes] = frozenset()):
         super().__init__()
         self.generic = generic
         self.dme_addr = dme_addr
@@ -83,6 +89,7 @@ class MockCar(QueueTransport):
         self.dynamic = dynamic  # False = fixed idle values (tests)
         self.vin = MOCK_VINS[model].encode()
         self.tcu = tcu  # a second ECU also answers generic OBD (answers first)
+        self.silent = silent  # request prefixes (e.g. b"\x01\x10") nobody answers
         self.t0 = time.monotonic()
 
     # -- wakeup ------------------------------------------------------------
@@ -93,7 +100,7 @@ class MockCar(QueueTransport):
         if address == self.dme_addr:
             self.addr = address
             return (0xEF, 0x8F)
-        raise KLineError(f"no 0x55 sync after 5-baud 0x{address:02X} (got nothing)")
+        raise NoResponse(f"no 0x55 sync after 5-baud 0x{address:02X} (got nothing)")
 
     def fast_init(self) -> None:
         self.addr = None  # target taken from StartCommunication header
@@ -110,14 +117,20 @@ class MockCar(QueueTransport):
         f = kwp2000.decode(data)
         if f.data[0] == 0x81:
             self.addr = f.target
-        if f.target == 0x33:
+        if f.target == 0x33 and f.data[0] == 0x81:  # fast init, generic OBD
+            replies = [(self.dme_addr, b"\xC1\xE9\x8F")] if self.generic == "kwp" else []
+        elif f.target == 0x33:
             replies = self._obd_all(f.data)
-        else:
+        elif f.target == self.dme_addr:
             replies = [(f.target, r) for r in self._kwp(f.data)]
+        else:
+            replies = []  # no ECU at that address
         for src, resp in replies:
             self.push(kwp2000.encode(resp, kwp2000.TESTER, src))
 
     def _obd_all(self, d: bytes) -> list[tuple[int, bytes]]:
+        if d[:2] in self.silent:
+            return []
         out = []
         if self.tcu:
             out.append((MOCK_TCU_ADDR, self._tcu_obd(d)))
@@ -143,27 +156,41 @@ class MockCar(QueueTransport):
             return b"\x43\x03\x00\x04\x20\x00\x00"  # P0300, P0420
         return None
 
+    # The PID 00 bitmap a real 2002 996 (ME7.8) sends: 01 03-09 0C-15 18 19 1C.
+    BITMAP = b"\xbf\x9f\xf9\x90"
+    # Status PIDs (values are placeholders): MIL off, 0 codes, evap not ready;
+    # closed loop; secondary air off; O2 sensors S1+S2 on both banks; OBD-II.
+    STATUS = {0x01: b"\x00\x07\x65\x04", 0x03: b"\x02\x00", 0x12: b"\x04",
+              0x13: b"\x33", 0x1C: b"\x01"}
+
     def _pid_bytes(self) -> dict[int, bytes]:
         if not self.dynamic:
             return {
-                0x00: b"\x1e\x1f\x80\x00",  # 04-07, 0C-11
+                0x00: self.BITMAP, **self.STATUS,
                 0x04: b"\x40", 0x05: b"\x80", 0x0C: (850 * 4).to_bytes(2, "big"),
                 0x0D: b"\x00", 0x0E: b"\x8c", 0x0F: b"\x3c", 0x10: b"\x02\x58",
-                0x11: b"\x22", 0x06: b"\x80", 0x07: b"\x82",
+                0x11: b"\x22", 0x06: b"\x80", 0x07: b"\x82", 0x08: b"\x80", 0x09: b"\x81",
+                0x14: b"\x5a\x80", 0x15: b"\x8c\xff", 0x18: b"\x50\x80", 0x19: b"\x8a\xff",
             }
-        e = _engine(time.monotonic() - self.t0)
+        t = time.monotonic() - self.t0
+        e = _engine(t)
         pct = lambda v: bytes([round(max(0, min(100, v)) * 255 / 100)])
         trim = lambda v: bytes([round(v * 128 / 100 + 128)])
+        o2 = lambda phase: bytes([round(90 + 80 * math.sin(t * 6 + phase)), 0x80])  # front: switching
         return {
-            0x00: b"\x1e\x1f\x80\x00",
+            0x00: self.BITMAP, **self.STATUS,
             0x04: pct(e["load"]), 0x05: bytes([round(e["coolant"]) + 40]),
             0x06: trim(e["stft"]), 0x07: trim(e["ltft"]),
+            0x08: trim(e["stft"] * 0.8), 0x09: trim(e["ltft"] * 0.5),
             0x0C: round(e["rpm"] * 4).to_bytes(2, "big"), 0x0D: bytes([round(e["speed"])]),
             0x0E: bytes([round((e["timing"] + 64) * 2)]), 0x0F: b"\x3c",
             0x10: round(e["maf"] * 100).to_bytes(2, "big"), 0x11: pct(e["throttle"]),
+            0x14: o2(0), 0x15: b"\x8c\xff", 0x18: o2(1.3), 0x19: b"\x8a\xff",
         }
 
     def _kwp(self, d: bytes) -> list[bytes]:
+        if d[:2] in self.silent:
+            return []
         sid = d[0]
         if sid == 0x81:
             return [b"\xC1\xEF\x8F"]
@@ -179,6 +206,8 @@ class MockCar(QueueTransport):
                 return [bytes([0x5A, d[1]]) + ids[d[1]]]
             return [bytes([0x7F, sid, 0x31])]
         if sid == 0x18:
+            if d[1] != 0x00:  # like the 996 ME7.8: only status 00 is accepted
+                return [bytes([0x7F, sid, 0x12])]
             return [b"\x58\x02\x03\x00\xE0\x11\x28\x20"]
         if sid == 0x21:
             lid = d[1]
@@ -186,5 +215,11 @@ class MockCar(QueueTransport):
                 return [b"\x7F\x21\x78", b"\x61\xEE\x01\x02"]
             if lid in (0x01, 0x02, 0x10):
                 return [bytes([0x61, lid]) + bytes(range(lid, lid + 6))]
+            if lid in MOCK_LIDS:  # same block sizes as a real 996 DME; contents fake
+                body = bytearray((lid * 7 + i * 13) & 0xFF for i in range(MOCK_LIDS[lid]))
+                if self.dynamic and lid in (0x04, 0x05):  # two bytes that move
+                    e = _engine(time.monotonic() - self.t0)
+                    body[0], body[1] = round(e["rpm"] / 40) & 0xFF, round(e["throttle"]) & 0xFF
+                return [bytes([0x61, lid]) + bytes(body)]
             return [bytes([0x7F, sid, 0x31])]
         return [bytes([0x7F, sid, 0x11])]

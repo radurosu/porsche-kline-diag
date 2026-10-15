@@ -2,8 +2,9 @@
 
 Open, modern diagnostics for K-line era water-cooled Porsches
 (986 Boxster, 996, 997.1, 987.1, Cayenne 955 — roughly 1997–2008).
-Status: **phase 0** — protocol stack + CLI, tested against a simulated car.
-Read-only by design.
+Status: **talks to a real car.** On a 2002 996 (Bosch ME7.8): live data over generic
+OBD (21 readings, incl. readiness), DME identification and fault codes over KWP2000, and
+the DME's raw Porsche data blocks. Over-rev counters aren't decoded yet. Read-only by design.
 
 ## Setup (macOS)
 
@@ -29,7 +30,7 @@ See [docs/HARDWARE.md](docs/HARDWARE.md).
 | `pdiag id --addr 0x10` | DME identification (KWP 0x1A) |
 | `pdiag dtc --addr 0x10` | DME fault codes (KWP 0x18) |
 | `pdiag lid-scan --addr 0x10` | Sweep local identifiers (KWP 0x21) → `logs/` |
-| `pdiag ui` | Web UI: live tach, over-rev report, fault codes, car info |
+| `pdiag ui` | Web UI: live tach and every reading, Porsche data blocks, fault codes, car info. Logs every reading to `logs/` |
 | `pdiag sniff` | Passive K-line capture (e.g. a Durametric session) |
 
 Global: `--port /dev/cu.usbserial-…` (or `PDIAG_PORT`), `--model 986|996|987|997` (default: detected

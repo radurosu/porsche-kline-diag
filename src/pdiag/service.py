@@ -1,41 +1,68 @@
 """One car, one K-line: serialises access and owns ECU session switching.
 
-The K-line talks to one ECU session at a time. Generic OBD (0x33) and the DME
-are separate sessions; switching re-inits. On real hardware we wait for the
-previous session to time out (P3max 5 s) before waking a different address.
+The K-line talks to one ECU session at a time. Generic OBD (0x33; ISO 9141-2 on
+a 2002 996) and the DME's own KWP2000 session (0x11) are separate sessions, even
+though the same ECU answers both; switching re-inits, and on real hardware we
+wait for the previous session to time out (P3max 5 s) first.
+
+Two live streams sit on top: live() for decoded OBD readings and dme_live() for
+the DME's raw Porsche data blocks. Both can log every read as JSONL.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from typing import TextIO
 
 from . import kwp2000, models, obd
-from .transport import KLineError, Transport
+from .transport import KLineError, NoResponse, Transport
 
 RPM_PID = 0x0C
-# Read rpm every sample and rotate through the rest, so the needle stays smooth
-# on a slow bus (ISO 9141-2 manages roughly 8-10 requests/s).
-ROTATING_PIDS = {0x05: "coolant_temp", 0x0E: "timing_advance", 0x11: "throttle",
-                 0x04: "engine_load", 0x10: "maf", 0x0D: "speed",
-                 0x06: "stft_b1", 0x07: "ltft_b1"}
-PER_SAMPLE = 2
+# Each sample reads rpm plus the next of every other PID the car supports, so
+# the needle gets every other request: a 2002 996 manages ~4.6 requests/s while
+# waiting for other ECUs, ~7 when only one answers (the mock is instant).
+# Status PIDs that rarely change are read once a minute instead.
+STATIC_PIDS = {0x01, 0x13, 0x1C}
+STATIC_REFRESH = 60.0
+# Porsche-specific data blocks (KWP 0x21 local IDs) a 2002 996 ME7.8 answered in a
+# full 01-FF sweep on 2026-10-15. Not decoded yet: shown and logged raw.
+DME_LIDS = (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+            0x14, 0xEA)
+# Rejections that mean "this ECU doesn't have that PID", as opposed to busy etc.
+NOT_SUPPORTED = {0x11, 0x12, 0x31}
 SESSION_TIMEOUT = 5.5
 # ECUs drop a session after P3max (5 s) without traffic. Past this much idle
 # time, assume it's gone and wake the ECU again instead of timing out.
 SESSION_IDLE = 4.0
-LIVE_MIN_INTERVAL = 0.09  # several browser tabs share one bus sample
 
 
 class NotDecoded(Exception):
     """Feature needs Porsche-specific data we haven't decoded yet."""
 
 
+def _num(v: float | str) -> float | str:
+    return round(v, 2) if isinstance(v, float) else v
+
+
+def id_text(data: bytes) -> str:
+    """An identification field for display: text without its padding, or hex
+    when the ECU sent binary."""
+    s = data.strip(b" \x00\xff")
+    if s and all(0x20 <= b < 0x7F for b in s):
+        return s.decode("ascii")
+    return data.hex()
+
+
 class Car:
     def __init__(self, t: Transport, model: models.Model | None = None,
                  dme_addr: int | None = None, mock: bool = False,
-                 port: str | None = None, label: str | None = None):
+                 port: str | None = None, label: str | None = None,
+                 live_log: TextIO | None = None, dme_log: TextIO | None = None):
         self.t = t
+        self.live_log = live_log  # one JSON line per live sample, fresh values only
+        self.dme_log = dme_log  # one JSON line per data block read
         self.model = model  # None until given or detected from the VIN
         self.label = label
         self.dme_addr = dme_addr if dme_addr is not None else (model or models.DEFAULT).dme_addr
@@ -45,14 +72,20 @@ class Car:
         self.link = None
         self.dme: kwp2000.Kwp2000Client | None = None
         self.info: dict = {}
-        self._supported: set[int] = set()
+        self._supported: set[int] | None = None  # None = bitmap unreadable: try every PID
+        self._supported_retried = False
+        self._dead_pids: set[int] = set()  # silent or rejected this session
+        self._static_due = 0.0
+        self._blocks: dict[str, str] = {}  # DME data blocks: lid -> hex, last read
+        self._dead_lids: set[int] = set()
+        self._last_lid = -1
         self._latest: dict = {}  # last value of every live PID, across samples
-        self._sample_t = 0.0
+        self._seq = 0  # samples taken; lets tabs share one sample instead of queueing
         self._last_session_end = 0.0
         self._last_io = 0.0
         self._pending = 0  # one-shot requests waiting; live streaming yields to them
         self._plock = threading.Lock()
-        self._rot = 0
+        self._last_pid = -1  # rotation cursor: the PID read last
 
     # -- sessions ----------------------------------------------------------
     def _drop(self) -> None:
@@ -79,12 +112,24 @@ class Car:
                 self._drop()
             self._settle()
             link, kb = obd.connect(self.t)
-            self._supported = set(obd.supported_pids(link))
+            self._supported = self._read_supported(link)
+            if getattr(link, "ecus", None) == 1:
+                link.settle = obd.SINGLE_ECU_SETTLE  # nobody else to wait for
+            self._supported_retried = False
+            self._dead_pids = set()
+            self._static_due = 0.0
             self._latest = {}
             self.link = link
             self.info["generic_protocol"] = link.name
             self.info["generic_keybytes"] = f"{kb[0]:02X} {kb[1]:02X}"
         return self.link
+
+    @staticmethod
+    def _read_supported(link) -> set[int] | None:
+        try:
+            return set(obd.supported_pids(link))
+        except KLineError:
+            return None  # the rpm read that follows tells whether the link is up
 
     def _dme(self) -> kwp2000.Kwp2000Client:
         self._expire()
@@ -117,7 +162,7 @@ class Car:
         with self.lock:
             try:
                 return fn()
-            except kwp2000.NegativeResponse:
+            except (kwp2000.NegativeResponse, obd.BadReply):
                 raise  # the ECU answered; the session is still up
             except KLineError:
                 self.link = self.dme = None
@@ -133,26 +178,84 @@ class Car:
                 "car": self.label or (self.model.name if self.model else "Porsche"),
                 "model": self.model.code if self.model else None,
                 "profile": m.profile(),
+                "units": {p.name: p.unit for p in obd.PIDS.values()},
                 "connected": bool(self.link or self.dme), **self.info}
 
     def live(self) -> dict:
-        """Full snapshot: rpm fresh, rotating PIDs as last read."""
+        """Full snapshot: rpm fresh, rotating PIDs as last read. If another tab took
+        a sample while this call waited for the bus, share it instead of queueing
+        a second one, so every tab gets every sample and the bus never idles."""
+        seen = self._seq
+
         def run():
-            if time.monotonic() - self._sample_t < LIVE_MIN_INTERVAL and self._latest:
+            if self._seq != seen and self._latest:
                 return dict(self._latest)
             link = self._obd()
-            out = {"rpm": round(obd.read_pid(link, RPM_PID)[0], 2)}
-            # Only PIDs the car reports: an unsupported one gets no answer on
-            # ISO 9141-2, which would look like a dead link.
-            items = [(p, n) for p, n in ROTATING_PIDS.items() if p in self._supported]
-            for _ in range(PER_SAMPLE if items else 0):
-                pid, name = items[self._rot % len(items)]
-                self._rot += 1
-                out[name] = round(obd.read_pid(link, pid)[0], 2)
+            if self._supported is None and not self._supported_retried:
+                self._supported_retried = True
+                self._supported = self._read_supported(link)
+            out = {"rpm": _num(obd.read_pid(link, RPM_PID)[0])}
+            usable = [p for p in sorted(obd.PIDS) if p != RPM_PID and p not in self._dead_pids
+                      and (self._supported is None or p in self._supported)]
+            rotating = [p for p in usable if p not in STATIC_PIDS]
+            todo = []
+            if rotating:  # the next PID after the last one read, so a drop skips nothing
+                self._last_pid = next((p for p in rotating if p > self._last_pid), rotating[0])
+                todo.append(self._last_pid)
+            if time.monotonic() >= self._static_due:
+                todo += [p for p in usable if p in STATIC_PIDS]
+                self._static_due = time.monotonic() + STATIC_REFRESH
+            for pid in todo:
+                self._read_into(out, link, pid)
             self._latest.update(out)
-            self._sample_t = time.monotonic()
+            self._seq += 1
+            if self.live_log:
+                self.live_log.write(json.dumps({"t": round(time.time(), 3), **out}) + "\n")
             return dict(self._latest)
         return self._guard(run, background=True)
+
+    def _read_into(self, out: dict, link, pid: int) -> None:
+        """Read one PID into `out`. rpm answered moments ago, so the link is up:
+        silence (ISO 9141-2) or "not supported" means this ECU lacks the PID, so
+        stop asking for this session. Busy or a garbled reply: try next time."""
+        name = obd.PIDS[pid].name
+        try:
+            out[name] = _num(obd.read_pid(link, pid)[0])
+        except NoResponse:
+            self._drop_pid(pid, name)
+        except kwp2000.NegativeResponse as e:
+            if e.code in NOT_SUPPORTED:
+                self._drop_pid(pid, name)
+        except obd.BadReply:
+            pass
+
+    def dme_live(self) -> dict:
+        """Read the next Porsche data block from the DME. Returns every block
+        read so far (hex) and which one is new."""
+        def run():
+            c = self._dme()
+            lids = [x for x in DME_LIDS if x not in self._dead_lids]
+            if not lids:
+                raise NotDecoded("The engine computer didn't return any data blocks.")
+            lid = self._last_lid = next((x for x in lids if x > self._last_lid), lids[0])
+            key = f"{lid:02x}"
+            try:
+                data = c.read_local_id(lid)
+            except kwp2000.NegativeResponse as e:
+                if e.code in NOT_SUPPORTED:  # this DME doesn't have that block
+                    self._dead_lids.add(lid)
+                    self._blocks.pop(key, None)
+                return {"blocks": dict(self._blocks), "new": None}
+            self._blocks[key] = data.hex()
+            if self.dme_log:
+                self.dme_log.write(json.dumps({"t": round(time.time(), 3), "lid": key,
+                                               "hex": data.hex()}) + "\n")
+            return {"blocks": dict(self._blocks), "new": key}
+        return self._guard(run, background=True)
+
+    def _drop_pid(self, pid: int, name: str) -> None:
+        self._dead_pids.add(pid)
+        self._latest.pop(name, None)
 
     def dtcs(self) -> list[dict]:
         from .mock import MOCK_DTC_TEXT
@@ -173,12 +276,17 @@ class Car:
     def ident(self) -> dict:
         def run():
             c = self._dme()
-            found = {}
+            found, answered, silent = {}, False, None
             for opt in (0x90, 0x9B, 0x91, 0x92, 0x94, 0x80):
                 try:
-                    found[f"{opt:02X}"] = c.read_ecu_id(opt).decode("ascii", "replace").strip()
+                    found[f"{opt:02X}"] = id_text(c.read_ecu_id(opt))
+                    answered = True
                 except kwp2000.NegativeResponse:
-                    pass
+                    answered = True
+                except NoResponse as e:
+                    silent = e  # some ECUs ignore options they lack; keep going
+            if not answered:
+                raise silent  # nothing answered at all: the session is gone
             vin = found.get("90")
             if self.model is None and (m := models.from_vin(vin)):
                 self.model = m

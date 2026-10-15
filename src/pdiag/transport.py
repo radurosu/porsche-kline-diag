@@ -4,14 +4,18 @@ The K-line is a single half-duplex wire. Consequences handled here:
 - Every byte we send is echoed back to us; we read and verify it (collision check).
 - Wakeup patterns (5-baud init, fast init) are produced by toggling the serial
   BREAK condition, which pulls the line low. 5-baud = 200 ms per bit, fast init
-  = 25 ms low + 25 ms high. On macOS, break timing via the Apple FTDI driver is
-  ms-accurate, which is fine for 5-baud and borderline for fast init (+/-1 ms
-  spec). If fast init proves flaky, fall back to 5-baud or pyftdi bit-bang.
+  = 25 ms low + 25 ms high. Apple's FTDI driver toggles BREAK in ~0.2 ms; both
+  inits work on a 2002 996.
+- A BREAK leaves a 00 byte in RX just after the line goes high. 5-baud init skips
+  it; drain() clears it (and any late reply) before the next request.
+- The port timeout is set once at open: pyserial reconfigures the UART on every
+  `timeout` assignment, which corrupts the byte on the wire. Waits use select().
 """
 
 from __future__ import annotations
 
 import json
+import select
 import time
 from collections import deque
 from typing import Protocol
@@ -19,10 +23,20 @@ from typing import Protocol
 BAUD = 10400
 IDLE_BEFORE_INIT = 0.3  # W5 / Tidle: line must be idle high >= 300 ms
 P4_INTERBYTE = 0.005  # tester inter-byte gap; some ME7 ECUs dislike 0
+# 5-baud init timing. The ECU may start its 0x55 sync up to W1max (300 ms) after
+# the stop bit; we also need the sync byte itself plus FTDI latency (up to 16 ms).
+SYNC_WAIT = 0.2 + 0.3 + 0.1  # stop bit + W1max + margin
+# W4 (25-50 ms) runs from KB2 to our ~KB2. Our read of KB2 returns up to 16 ms
+# late (FTDI latency), so sleep near the low end: 26-44 ms on the wire.
+W4_SLEEP = 0.026
 
 
 class KLineError(Exception):
     pass
+
+
+class NoResponse(KLineError):
+    """Nothing answered at all, as opposed to a garbled or rejected answer."""
 
 
 class Transport(Protocol):
@@ -31,6 +45,7 @@ class Transport(Protocol):
     def write(self, data: bytes) -> None: ...
     def read(self, n: int, timeout: float) -> bytes: ...
     def read_until_gap(self, gap: float, first_timeout: float) -> bytes: ...
+    def drain(self) -> bytes: ...
     def flush(self) -> None: ...
     def close(self) -> None: ...
 
@@ -47,10 +62,18 @@ class SerialTransport:
                  p4: float = P4_INTERBYTE):
         import serial
 
+        # timeout=0 once, never changed: pyserial 3.5 reconfigures the port on every
+        # `ser.timeout = x` (tcsetattr at 38400, then IOSSIOSPEED back to 10400 on
+        # macOS), which corrupts any byte on the wire. Waiting is done with select().
         self.ser = serial.Serial(port, baud, bytesize=8, parity="N", stopbits=1,
-                                 timeout=0.1)
+                                 timeout=0)
         self.echo = echo
         self.p4 = p4
+
+    def _wait(self, timeout: float) -> bool:
+        """True once bytes are waiting, False if `timeout` passes first."""
+        ready, _, _ = select.select([self.ser.fileno()], [], [], max(timeout, 0.0))
+        return bool(ready)
 
     def five_baud_init(self, address: int) -> tuple[int, int]:
         """Send `address` at 5 baud, return the ECU's two keybytes.
@@ -75,19 +98,19 @@ class SerialTransport:
         s.reset_input_buffer()
 
         junk = bytearray()
-        deadline = time.perf_counter() + 0.2 + 0.3  # stop bit + W1 max
+        deadline = time.perf_counter() + SYNC_WAIT
         while (rem := deadline - time.perf_counter()) > 0:
             b = self.read(1, rem)
             if b == b"\x55":
                 break
             junk += b
         else:
-            raise KLineError(f"no 0x55 sync after 5-baud 0x{address:02X} "
+            raise NoResponse(f"no 0x55 sync after 5-baud 0x{address:02X} "
                              f"(got {junk.hex() or 'nothing'})")
         kb = self.read(2, 0.1)
         if len(kb) != 2:
             raise KLineError(f"keybytes incomplete: {kb.hex()}")
-        time.sleep(0.03)  # W4
+        time.sleep(W4_SLEEP)
         self.write(bytes([kb[1] ^ 0xFF]))
         inv = self.read(1, 0.1)
         if inv != bytes([address ^ 0xFF]):
@@ -125,20 +148,23 @@ class SerialTransport:
     def read(self, n: int, timeout: float) -> bytes:
         buf = bytearray()
         deadline = time.perf_counter() + timeout
-        while len(buf) < n and (rem := deadline - time.perf_counter()) > 0:
-            self.ser.timeout = rem
-            buf += self.ser.read(n - len(buf))
+        while len(buf) < n:
+            rem = deadline - time.perf_counter()
+            if rem <= 0 or not self._wait(rem):
+                break
+            buf += self.ser.read(n - len(buf))  # non-blocking: what's there
         return bytes(buf)
 
     def read_until_gap(self, gap: float, first_timeout: float) -> bytes:
-        first = self.read(1, first_timeout)
-        if not first:
-            return b""
-        buf = bytearray(first)
-        self.ser.timeout = gap
-        while b := self.ser.read(1):
-            buf += b
+        buf = bytearray(self.read(1, first_timeout))
+        while buf and self._wait(gap):
+            buf += self.ser.read(256)
         return bytes(buf)
+
+    def drain(self) -> bytes:
+        """Take whatever is already buffered (late replies), without waiting."""
+        n = self.ser.in_waiting
+        return self.ser.read(n) if n else b""
 
     def flush(self) -> None:
         self.ser.reset_input_buffer()
@@ -195,6 +221,12 @@ class TracingTransport:
         self._log("rx", hex=d.hex())
         return d
 
+    def drain(self) -> bytes:
+        d = self.inner.drain()
+        if d:  # a reply that came too late: the timing data matters
+            self._log("stale", hex=d.hex())
+        return d
+
     def flush(self) -> None:
         self.inner.flush()
 
@@ -228,6 +260,11 @@ class QueueTransport:
 
     def read_until_gap(self, gap: float, first_timeout: float) -> bytes:
         return self.rx.popleft() if self.rx else b""
+
+    def drain(self) -> bytes:
+        d = b"".join(self.rx)
+        self.rx.clear()
+        return d
 
     def flush(self) -> None:
         self.rx.clear()

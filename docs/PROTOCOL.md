@@ -23,6 +23,15 @@ Generic OBD address is `0x33`.
 (e.g. `81 10 F1 81 03`). Response `C1 KB1 KB2`.
 
 Implemented via serial BREAK toggling (`transport.py`). Unverified on macOS hardware.
+Tester-side margins for the FTDI latency timer (up to 16 ms before received bytes reach
+us): wait 600 ms for the sync from the start of the stop bit (stop 200 + W1max 300 +
+margin); sleep 26 ms for W4, so the wire sees 26–44 ms.
+
+## Traces
+`logs/*.jsonl`, one op per line: `5baud`/`fastinit`, `keybytes`, `tx`, `rx`, `error`, and
+`stale` = bytes that arrived after we stopped waiting for a reply (drained before the
+next request). `stale` lines tell us real ECU response times; if they show up a lot, the
+wait windows (`MULTI_GAP`, `DTC_SETTLE`, ISO 9141 settle) are too short.
 
 ## KWP2000 frame
 `[fmt][tgt][src]([len]) data… [cs]`
@@ -41,8 +50,8 @@ messages are split on timing gaps.
 | SID | Name | Notes |
 |---|---|---|
 | 10 | startDiagnosticSession | mode 81 default; 89 seen on VAG ME7 (try if needed) |
-| 1A | readEcuIdentification | options 80–9F; which ones the DME supports is unknown |
-| 18 | readDTCByStatus | `18 02 FF 00` = all DTCs |
+| 1A | readEcuIdentification | ME7.8 answers 80, 90, 91, 92, 94, 9B (see Findings) |
+| 18 | readDTCByStatus | `18 00 FF 00` = all stored DTCs (ME7.8; status `02` → NRC 12) |
 | 21 | readDataByLocalIdentifier | Porsche-specific data expected here |
 | 3E | testerPresent | keepalive |
 | 82 | stopCommunication | |
@@ -58,9 +67,10 @@ Location and encoding are **unknown**. Plan:
 
 ## Models
 `src/pdiag/models.py`. Model is detected from the VIN (public layout): WMI `WP0`, positions
-7-8 `98` = Boxster/Cayman, `99` = 911, position 10 = model year. 98 + ≤2004 → 986,
-98 + 2005–08 → 987.1, 99 + ≤2004 → 996, 99 + 2005–08 → 997.1. MY2005 `99` is ambiguous
-(996 Turbo/GT2/GT3 overlap) → `--model 996`. MY2009+ (987.2/997.2) is out of scope.
+7-8 `98` = Boxster/Cayman, `99` = 911, position 10 = model year (read as 1997–2026, so
+`A` = 2010). 98 + 1997–2004 → 986, 98 + 2005–08 → 987.1, 99 + 1998–2004 → 996,
+99 + 2005–08 → 997.1. MY1997 `99` is an air-cooled 993 (not supported). MY2005 `99` is
+ambiguous (996 Turbo/GT2/GT3 overlap) → `--model 996`. MY2009+ (987.2/997.2) is out of scope.
 Per-model DME address, redline and over-rev boundaries are **placeholders**, identical for
 all models until a capture of each says otherwise.
 
@@ -71,4 +81,11 @@ can't reach, even if its DME still talks K-line. Unverified; first 987 trace set
 ## Findings
 | Date | Item | Value | Source |
 |---|---|---|---|
-| — | — | — | — |
+| 2026-10-15 | Generic OBD, 2002 US 996 (ME7.8) | ISO 9141-2: 5-baud `0x33` as plain 8N1 (no parity needed), keybytes `08 08`, sync ~70–90 ms after the stop bit. One ECU answers, source `0x11`. | own capture, `pdiag obd` |
+| 2026-10-15 | Supported PIDs | PID 00 = `BF 9F F9 90`: 01 03–09 0C–15 18 19 1C. No MAP (MAF car). | own capture |
+| 2026-10-15 | DME address | `0x11`, KWP2000 keybytes `EF 8F`; 5-baud and fast init both work. `0x10`, `0x01`, `0x12` silent. | own capture, `pdiag probe --init both` |
+| 2026-10-15 | DME identification (1A) | 90 VIN (17 chars), 91 Porsche part no. (11 digits), 92 Bosch hardware no. (10 digits), 94 Bosch software no. (10 digits), 9B 16 digits (meaning unknown), 80 all of them concatenated; 86, 8A → NRC 12. Values stay in private logs. | own capture, `pdiag id` |
+| 2026-10-15 | DME fault codes (18) | `18 00 FF 00` / `18 00 00 00` → `58 00` (none stored); status 01, 02, 03 → NRC 12 | own capture |
+| 2026-10-15 | DME data blocks (21) | 01–0C, 14, EA answer: 2, 10, 1, 35, 35, 103, 63, 70, 149, 35, 34, 67, 4, 3 bytes. 04 and 05 hold live data. LID 10 → NRC 10 (generalReject: other session?); the other 240 → NRC 12. | own capture, `pdiag lid-scan` |
+| 2026-10-15 | OBD inside the DME session | `01 xx`, `03` → NRC 11: generic OBD only via `0x33` / ISO 9141-2 | own capture |
+| 2026-10-15 | Timing | ISO 9141-2 request ~140 ms with one ECU (30 ms wait for others) → ~7 requests/s; KWP `21 xx` ~175 ms. FTDI latency timer 16 ms. | own capture, UI trace |

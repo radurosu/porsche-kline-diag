@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -10,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import kwp2000, models, obd
-from .transport import KLineError, SerialTransport, TracingTransport
+from .transport import KLineError, NoResponse, SerialTransport, TracingTransport
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 
@@ -30,7 +31,11 @@ def open_transport(args, cmd: str):
                     model=args.model or "996")
     else:
         port = args.port or os.environ.get("PDIAG_PORT") or _guess_port()
-        t = SerialTransport(port)
+        try:
+            t = SerialTransport(port)
+        except OSError as e:  # serial.SerialException: missing, unplugged or busy
+            sys.exit(f"cannot open {port}: {e}\n(is another pdiag, e.g. `pdiag ui`, "
+                     "using the cable?)")
         print(f"port: {port}", file=sys.stderr)
     if args.no_trace or (args.mock and cmd == "ui"):
         return t
@@ -82,9 +87,14 @@ def cmd_probe(args, t):
                 print(f"0x{a:02X} {init}: keybytes {kb[0]:02X} {kb[1]:02X}"
                       + ("  (KWP2000)" if kb[1] == kwp2000.KWP_KB2 else ""))
                 awake = True
-            except KLineError as e:
+            except NoResponse as e:
                 print(f"0x{a:02X} {init}: {e}")
                 awake = False
+            except KLineError as e:
+                # Something answered (a rejection, a partial handshake): the ECU
+                # is awake even though the wake-up failed.
+                print(f"0x{a:02X} {init}: {e}")
+                awake = True
             if not args.mock:
                 # An ECU that woke stays in session until P3max passes.
                 time.sleep(SESSION_TIMEOUT if awake else 0.5)
@@ -93,26 +103,44 @@ def cmd_probe(args, t):
 def cmd_obd(args, t):
     link, kb = obd.connect(t, args.init)
     print(f"protocol: {link.name}  keybytes {kb[0]:02X} {kb[1]:02X}")
-    pids = obd.supported_pids(link)
-    print("supported PIDs:", " ".join(f"{p:02X}" for p in pids))
+    try:
+        pids = obd.supported_pids(link)
+        print("supported PIDs:", " ".join(f"{p:02X}" for p in pids))
+    except KLineError as e:
+        pids = sorted(obd.PIDS)
+        print(f"supported PIDs: unknown ({e}); trying every known PID")
+    # One run should yield as much as possible: a failed PID doesn't stop the rest.
     for p in pids:
         if p in obd.PIDS:
-            v, raw = obd.read_pid(link, p)
-            print(f"  {obd.PIDS[p].name:16s} {v:9.2f} {obd.PIDS[p].unit}")
+            try:
+                v, raw = obd.read_pid(link, p)
+                shown = v if isinstance(v, str) else f"{v:9.2f} {obd.PIDS[p].unit}"
+                print(f"  {obd.PIDS[p].name:16s} {shown}")
+            except KLineError as e:
+                print(f"  {obd.PIDS[p].name:16s} {e}")
     print("stored DTCs:", ", ".join(obd.read_stored_dtcs(link)) or "none")
 
 
 def cmd_live(args, t):
     link, _ = obd.connect(t, args.init)
-    names = [obd.PIDS[p].name for p in args.pids]
-    print("t," + ",".join(names))
+    names = [obd.PIDS[p].name if p in obd.PIDS else f"pid_{p:02x}" for p in args.pids]
+    out = csv.writer(sys.stdout, lineterminator="\n")  # status texts contain commas
+    out.writerow(["t", *names])
     t0 = time.perf_counter()
     n = 0
     try:
         while args.count == 0 or n < args.count:
-            vals = [obd.read_pid(link, p)[0] for p in args.pids]
-            print(f"{time.perf_counter() - t0:.2f}," + ",".join(f"{v:.2f}" for v in vals),
-                  flush=True)
+            vals = []
+            for p in args.pids:  # a PID that fails leaves its column empty
+                try:
+                    v = obd.read_pid(link, p)[0]
+                    vals.append(v if isinstance(v, str) else f"{v:.2f}")
+                except (NoResponse, kwp2000.NegativeResponse, obd.BadReply):
+                    vals.append("")
+            if not any(vals):
+                raise KLineError("no PID answered; is the engine computer still awake?")
+            out.writerow([f"{time.perf_counter() - t0:.2f}", *vals])
+            sys.stdout.flush()
             n += 1
     except KeyboardInterrupt:
         pass
@@ -125,7 +153,7 @@ def cmd_id(args, t):
             d = c.read_ecu_id(opt)
             txt = d.decode("ascii", "replace")
             print(f"1A {opt:02X}: {d.hex()}  |{txt}|")
-        except kwp2000.NegativeResponse as e:
+        except (kwp2000.NegativeResponse, NoResponse) as e:
             print(f"1A {opt:02X}: {e}")
     c.stop()
 
@@ -143,17 +171,26 @@ def cmd_lid_scan(args, t):
     c = _dme(args, t)
     out = LOG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-lids.jsonl"
     LOG_DIR.mkdir(exist_ok=True)
+    misses = 0  # requests in a row with no usable answer
     with open(out, "w") as f:
+        # No testerPresent needed: every request keeps the session alive.
         for lid in range(args.start, args.end + 1):
             try:
                 d = c.read_local_id(lid)
                 rec = {"lid": f"{lid:02x}", "hex": d.hex()}
                 print(f"21 {lid:02X}: {d.hex()}")
+                misses = 0
             except kwp2000.NegativeResponse as e:
                 rec = {"lid": f"{lid:02x}", "nrc": f"{e.code:02x}"}
+                misses = 0
+            except KLineError as e:  # silence or garbled: note it, keep sweeping
+                rec = {"lid": f"{lid:02x}", "error": str(e)}
+                misses += 1
             f.write(json.dumps(rec) + "\n")
-            if lid % 16 == 15:
-                c.tester_present()
+            if misses == 3:
+                print(f"no answer to 3 LIDs in a row, stopping at 21 {lid:02X}. "
+                      f"Rerun with --start 0x{lid - 2:02X} once the ECU answers again.")
+                break
     print(f"results: {out}")
     c.stop()
 
@@ -191,8 +228,20 @@ def cmd_ui(args, t):
     from .web import serve
     port = None if args.mock else getattr(getattr(t, "inner", t), "ser", None).port
     model = models.MODELS[args.model] if args.model else None
-    serve(Car(t, model=model, dme_addr=args.addr, mock=args.mock, port=port, label=args.car),
-          port=args.http_port, open_browser=not args.no_browser)
+    logs = {}
+    if not args.mock:  # decoded live samples and raw DME blocks, next to the byte trace
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        for kind in ("live", "dme"):
+            path = LOG_DIR / f"{stamp}-{kind}.jsonl"
+            logs[kind] = open(path, "a", buffering=1)
+            print(f"{kind} log: {path}", file=sys.stderr)
+    try:
+        serve(Car(t, model=model, dme_addr=args.addr, mock=args.mock, port=port,
+                  label=args.car, live_log=logs.get("live"), dme_log=logs.get("dme")),
+              port=args.http_port, open_browser=not args.no_browser)
+    finally:
+        for f in logs.values():
+            f.close()
 
 
 def main(argv=None):
@@ -208,7 +257,7 @@ def main(argv=None):
 
     sub.add_parser("ports", help="list serial ports")
 
-    p = sub.add_parser("probe", help="5-baud init a list of addresses")
+    p = sub.add_parser("probe", help="wake a list of addresses (5-baud and/or fast init)")
     p.add_argument("--addrs", type=_hexlist, default=[0x33, 0x10, 0x11, 0x01, 0x12])
     p.add_argument("--init", choices=["5baud", "fast", "both"], default="5baud")
 
@@ -224,8 +273,8 @@ def main(argv=None):
                       ("dtc", "DME fault codes (0x18)"),
                       ("lid-scan", "sweep readDataByLocalIdentifier (0x21)")):
         p = sub.add_parser(name, help=hlp)
-        p.add_argument("--addr", type=_parse_int, default=0x10,
-                       help="DME K-line address (unverified; default 0x10)")
+        p.add_argument("--addr", type=_parse_int, default=0x11,
+                       help="DME K-line address (0x11 on a 2002 996 ME7.8)")
         p.add_argument("--init", choices=["5baud", "fast"], default="5baud")
         p.add_argument("--session", type=_parse_int, default=None,
                        help="startDiagnosticSession mode, e.g. 0x81 or 0x89")
@@ -238,7 +287,7 @@ def main(argv=None):
 
     p = sub.add_parser("ui", help="open the local web interface")
     p.add_argument("--addr", type=_parse_int, default=None,
-                   help="DME K-line address (default: the model's, unverified 0x10)")
+                   help="DME K-line address (default: the model's, 0x11)")
     p.add_argument("--car", default=None, help="name shown in the header, e.g. '996 Targa'")
     p.add_argument("--http-port", type=int, default=8996)
     p.add_argument("--no-browser", action="store_true")
@@ -249,6 +298,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "ports":
         return cmd_ports(args)
+    if args.cmd == "sniff" and args.mock:
+        sys.exit("sniff listens to a real K-line: it needs the cable, not --mock")
 
     t = open_transport(args, args.cmd)
     if args.cmd == "sniff" and isinstance(getattr(t, "inner", t), SerialTransport):

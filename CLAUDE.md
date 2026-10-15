@@ -29,21 +29,26 @@ step so one run produces enough trace data to debug from.
 4. Runs on **macOS** (Radu's machine). Python 3.11+, `uv`, pyserial. No Windows-only deps.
 
 ## Architecture (`src/pdiag/`)
-- `transport.py` — K-line byte I/O on a KKL cable: echo removal, 5-baud init and fast init
-  via serial BREAK, `TracingTransport` (JSONL trace), `QueueTransport` (mock base).
+- `transport.py` — K-line byte I/O on a KKL cable: echo check, 5-baud and fast init via serial
+  BREAK, `drain()` of late bytes, `TracingTransport` (JSONL trace), `QueueTransport` (mock
+  base). The pyserial timeout is set once (assigning it reconfigures the UART); waits use select().
 - `kwp2000.py` — ISO 14230 framing (encode/decode/split, checksum), `Kwp2000Client` with
-  read-only services (0x10, 0x1A, 0x18, 0x21, 0x3E, 0x82), NRC handling incl. 0x78 pending.
-- `obd.py` — generic OBD-II over ISO 9141-2 or KWP2000; PID decoders; mode 03 DTCs.
-- `models.py` — model profiles (986/996/987.1/997.1) and VIN → model detection. DME values
-  per model are placeholders.
-- `mock.py` — simulated car (`--mock`, `--model` picks which). Values are **fake placeholders**,
-  not real decodes. `tcu=True` adds a second ECU answering generic OBD.
+  read-only services (0x10, 0x1A, 0x18, 0x21, 0x3E, 0x82), NRC handling incl. 0x78 pending,
+  multi-ECU collection for functional requests.
+- `obd.py` — generic OBD-II over ISO 9141-2 or KWP2000; decoders for every PID a 2002 996
+  reports (incl. readiness and status texts); mode 03 DTCs.
+- `models.py` — model profiles (986/996/987.1/997.1) and VIN → model detection. DME address
+  0x11 is verified on the 996; the other DME values are placeholders.
+- `mock.py` — simulated car shaped like the real 996 (PID bitmap, keybytes, addresses, block
+  sizes); values are **fake placeholders**. `tcu=True` adds a second ECU, `silent=` drops replies.
 - `cli.py` — `pdiag` commands (see README).
-- `service.py` — `Car`: one K-line, a lock, and switching between the generic OBD session
-  and the DME session (5.5 s settle on hardware). Live streaming yields to one-shot requests.
-  Live reads rpm every sample and rotates the other PIDs.
-- `web.py` + `static/` — `pdiag ui`: stdlib HTTP server, JSON API, SSE `/api/live`. Vanilla
-  HTML/CSS/JS with no build step. The over-rev report is mock-only until decoded (501 on hardware).
+- `service.py` — `Car`: one K-line, a lock, session switching between generic OBD (0x33) and
+  the DME (0x11) with a 5.5 s settle. `live()`: rpm every other request plus a rotation of
+  every supported PID (statuses once a minute), shared by all tabs. `dme_live()`: the DME's
+  data blocks, round-robin. Both log JSONL.
+- `web.py` + `static/` — `pdiag ui`: stdlib HTTP server, JSON API, SSE `/api/live` and
+  `/api/dme-live`, Host check. Vanilla HTML/CSS/JS with no build step. The over-rev report is
+  mock-only until decoded (501 on hardware).
 Tests: `uv run pytest` (all against the mock).
 
 ## UI design (keep consistent)
@@ -53,38 +58,38 @@ hairline rules, no card grids, no shadows. Palette: pale seal-grey paper `#E3E5E
 ink, dark gauge face, 996 orange needle `#F25C19`, amber for caution, red for serious, teal
 for OK. Type: Archivo only, using its width axis (expanded headings, condensed numerals).
 Copy: plain sentences, the verdict first. Units default to US (°F, mph) with a toggle.
+Live: the needle eases between readings; under it, a quiet list of everything the engine
+computer reports, whose rows never jump. Porsche data: raw DME blocks as hexdump rows, static
+bytes dim, bytes that moved in ink, the latest change amber.
 
-## Status (2026-10-14)
-- Phase 0 done: stack + CLI + mock + tests. **Never run on real hardware yet.**
-- Web UI (`pdiag ui`) done against the mock (2026-10-13). Over-rev range boundaries and all
-  mock values are placeholders.
-- 2026-10-14: 987.1 support (model profiles, VIN detection, `--model`). Bug fixes before
-  first hardware run: P4 timing in `write` (FTDI latency), junk before 5-baud sync,
-  multi-ECU OBD replies (stale replies leaked into later requests), split ISO 9141
-  messages, unbounded request loop, unsupported PIDs/NRCs killing the live session,
-  sessions not reopened after P3max idle, probe waited 2.5 s < P3max, sniff splitter
-  resync across chunks.
-- Cable: ordered 2026-10-13, KKL 409.1 FT232RL (Amazon B0DG2NCJ4Z). Not yet tested. On arrival,
-  check that it enumerates as FTDI (vendor 0x0403) and shows up as `/dev/cu.usbserial-*`.
+## Status (2026-10-15)
+- Phase 0 plus three review rounds done (details in git history).
+- **First car session 2026-10-15 (2002 996 Targa, US, ME7.8): it works.** Generic OBD over
+  ISO 9141-2 (0x33), 21 live readings; DME over KWP2000 at 0x11: identification, fault codes
+  (`18 00 FF 00`), 14 data blocks. Live UI on the car: ~7 requests/s, needle ~3.5 updates/s.
+  Facts in docs/PROTOCOL.md (Findings), cable notes in docs/HARDWARE.md.
+- Fixed on the car: pyserial's `timeout` setter reconfigured the UART on every read and
+  corrupted bytes.
+- Lessons: confirm the dash lights and check-engine lamp are on before a run (accessory
+  position gives a silent car). Plug OBD first, then USB, or the FT232R can wedge
+  (`tcsetattr: Invalid argument`) until USB is replugged.
+- Over-rev counters: not decoded.
 
 ## Next steps
-1. Get the KKL FTDI cable → `pdiag ports` → `pdiag obd` (engine running). Proves cable,
-   driver, BREAK-based 5-baud timing on macOS, and the generic protocol (9141 vs KWP).
-2. `pdiag probe --init both` → find the DME's K-line address, init type and keybytes.
-3. `pdiag id` / `pdiag dtc` against the DME; try `--session 0x81` / `0x89` if rejected.
-4. **The gate:** read the over-rev counters (ranges 1–6). Best route: sniff a real
-   Durametric session (`pdiag sniff`, second cable on an OBD splitter) and decode the
-   request/response pairs. Fallback: `pdiag lid-scan` + correlation, or ME7 RAM logging.
-5. Only after the gate: phone app + BLE dongle (ESP32 + L9637).
+1. **The gate:** decode the over-rev counters (ranges 1–6). Best route: sniff a Durametric
+   session (`pdiag sniff`, our cable on an OBD Y-splitter) with notes of what it shows when.
+   Fallbacks: LID 09 (149 bytes, starts with six equal bytes — an unverified lead), LID 10
+   (general reject: try `--session 0x81` / `0x89`), memory read (0x23, read-only).
+2. Decode the live bytes in LIDs 04/05 by correlating `logs/*-dme.jsonl` with throttle and
+   rpm changes (one variable at a time).
+3. Only after the gate: phone app + BLE dongle (ESP32 + L9637).
 
 ## Open questions
-- DME K-line address on 996 ME7.8 (0x10 is a guess) and whether it wants 5-baud or fast init.
-- Required diagnostic session mode for Porsche-specific reads.
-- Where the over-rev counters / misfire counters live (local ID? memory read?).
-- Whether macOS BREAK timing is accurate enough for fast init (25 ms ±1).
-- Does the US 2002 996 speak ISO 9141-2 or KWP2000 for generic OBD?
+- Where the over-rev and misfire counters live (a LID? memory read?).
+- What session LID 10 wants; what identification option 9B (16 digits) means.
+- DTC status semantics on ME7.8 (no stored codes to test with yet).
 - 987.1/997.1: same DME address and services as the 996? US MY2008: generic OBD on CAN only?
-- 5-baud address parity: 0x33 sent as plain 8N1; ISO 9141 may expect 7O1 (0xB3). Try if no sync.
+- The page's live stream closed itself once when the cable came back; no repeat since.
 
 ## Conventions
 - Small modules, no frameworks. Match existing style. Hex in logs lower-case, no spaces.

@@ -1,4 +1,9 @@
-"""Local web UI: stdlib HTTP server, JSON API, Server-Sent Events for live data."""
+"""Local web UI: stdlib HTTP server, JSON API, Server-Sent Events for live data.
+
+JSON: /api/status, /api/ident, /api/dtcs, /api/over-rev.
+Streams: /api/live (decoded OBD readings), /api/dme-live (raw DME data blocks).
+Only requests addressed to 127.0.0.1 or localhost are answered (DNS rebinding).
+"""
 
 from __future__ import annotations
 
@@ -41,13 +46,20 @@ def make_handler(car: Car):
                 self._json(500, {"error": f"{type(e).__name__}: {e}", "kind": "internal"})
 
         def do_GET(self):
+            # Only answer pages addressed to us. A site using DNS rebinding sends
+            # its own name as Host; without this it could read the VIN.
+            port = self.server.server_address[1]
+            if self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                return self._json(403, {"error": "forbidden host"})
             path = self.path.split("?")[0]
             routes = {"/api/status": car.status, "/api/dtcs": car.dtcs,
                       "/api/ident": car.ident, "/api/over-rev": car.over_rev}
             if path in routes:
                 return self._api(routes[path])
             if path == "/api/live":
-                return self._live()
+                return self._stream(car.live, lambda v: {"values": v})
+            if path == "/api/dme-live":
+                return self._stream(car.dme_live, lambda v: v)
             f = STATIC / ("index.html" if path == "/" else path.lstrip("/"))
             if f.resolve().parent != STATIC.resolve() or not f.is_file():
                 return self._json(404, {"error": "not found"})
@@ -58,7 +70,8 @@ def make_handler(car: Car):
             self.end_headers()
             self.wfile.write(data)
 
-        def _live(self):
+        def _stream(self, read, shape):
+            """Server-Sent Events: one message per read, until the page goes away."""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -67,9 +80,13 @@ def make_handler(car: Car):
                 while True:
                     t0 = time.perf_counter()
                     try:
-                        msg = {"t": time.time(), "values": car.live()}
+                        msg = {"t": time.time(), **shape(read())}
+                    except NotDecoded as e:
+                        msg = {"error": str(e), "kind": "not_decoded"}
                     except KLineError as e:
-                        msg = {"error": str(e)}
+                        msg = {"error": str(e), "kind": "kline"}
+                    except Exception as e:  # a bug must not silently kill the stream
+                        msg = {"error": f"{type(e).__name__}: {e}", "kind": "internal"}
                     self.wfile.write(f"data: {json.dumps(msg)}\n\n".encode())
                     self.wfile.flush()
                     if "error" in msg:

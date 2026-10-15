@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from .transport import KLineError, Transport
+from .transport import KLineError, NoResponse, Transport
 
 TESTER = 0xF1
 P2_TIMEOUT = 1.0  # spec P2max is 50 ms; generous until real ECU timing is known
@@ -19,7 +19,7 @@ P2_PENDING = 5.0  # after NRC 0x78 (response pending)
 P3_MIN = 0.055  # min gap between ECU response and next request
 P1_INTERBYTE = 0.05
 REQUEST_DEADLINE = 30.0  # total per request, incl. responsePending extensions
-MULTI_GAP = 0.1  # after a reply, wait this long for other ECUs (functional requests)
+MULTI_GAP = 0.1  # after a positive reply, wait this long for other ECUs (functional)
 
 NRC = {
     0x10: "generalReject",
@@ -129,10 +129,6 @@ def split_frames(raw: bytes) -> list[Frame]:
     return split_stream(raw)[0]
 
 
-class NoResponse(KLineError):
-    pass
-
-
 class NegativeResponse(KLineError):
     def __init__(self, service: int, code: int):
         self.service, self.code = service, code
@@ -182,17 +178,19 @@ class Kwp2000Client:
         """Send a request, return positive response data (incl. SID+0x40)."""
         return self._exchange(data, multi=False)[0]
 
-    def request_all(self, data: bytes) -> list[bytes]:
+    def request_all(self, data: bytes, settle: float = MULTI_GAP) -> list[bytes]:
         """For functional requests that several ECUs answer (e.g. DME and a
-        Tiptronic TCU): every positive response, in arrival order. A negative
-        response from one ECU is raised only if no ECU answered positively."""
-        return self._exchange(data, multi=True)
+        Tiptronic TCU): every positive response, in arrival order. After each
+        answer, keep listening `settle` seconds for more. A negative response from
+        one ECU is raised only if no ECU answered positively."""
+        return self._exchange(data, multi=True, settle=settle)
 
-    def _exchange(self, data: bytes, multi: bool) -> list[bytes]:
+    def _exchange(self, data: bytes, multi: bool, settle: float = MULTI_GAP) -> list[bytes]:
         sid = data[0]
         wait = self._last_rx + getattr(self.t, "p3", P3_MIN) - time.perf_counter()
         if wait > 0:
             time.sleep(wait)
+        self.t.drain()  # a late reply to an earlier request must not pass as this one's
         self.t.write(encode(data, self.target, self.source, self.functional))
         out: list[bytes] = []
         nrc: NegativeResponse | None = None
@@ -201,14 +199,21 @@ class Kwp2000Client:
         deadline = time.perf_counter() + REQUEST_DEADLINE
         while True:
             if time.perf_counter() > deadline:
+                if out:
+                    return out
                 raise KLineError(f"no final response to service 0x{sid:02X} "
                                  f"within {REQUEST_DEADLINE:.0f} s")
             try:
                 f = read_frame(self.t, timeout)
-            except NoResponse:
+            except KLineError as e:
+                if not isinstance(e, NoResponse):
+                    self._last_rx = time.perf_counter()  # bytes did arrive
+                # A timeout or a garbled frame ends the collection. Keep the answers
+                # that arrived intact; drain() clears any leftovers before the next
+                # request.
                 if out:
                     return out
-                if nrc:
+                if nrc and isinstance(e, NoResponse):
                     raise nrc
                 raise
             self._last_rx = time.perf_counter()
@@ -229,7 +234,10 @@ class Kwp2000Client:
                     return out
             else:
                 continue  # frame not for this request (other ECU / stale)
-            timeout = P2_PENDING if pending else MULTI_GAP
+            # Wait briefly for more ECUs once an answer is in hand. Until then,
+            # allow the full response time: one ECU rejecting quickly says nothing
+            # about when another will answer.
+            timeout = P2_PENDING if pending else settle if out else P2_TIMEOUT
 
     # -- read-only services ------------------------------------------------
     def start_session(self, mode: int = 0x81) -> bytes:
@@ -244,8 +252,9 @@ class Kwp2000Client:
     def read_local_id(self, lid: int) -> bytes:
         return self.request(bytes([0x21, lid]))[2:]
 
-    def read_dtcs(self, status: int = 0x02, group: int = 0xFF00) -> list[tuple[int, int]]:
-        """readDTCByStatus -> [(dtc16, status)]."""
+    def read_dtcs(self, status: int = 0x00, group: int = 0xFF00) -> list[tuple[int, int]]:
+        """readDTCByStatus -> [(dtc16, status)]. `18 00 FF 00` = all stored DTCs.
+        The 996 ME7.8 rejects status 0x02 (VW ME7's usual request) with NRC 12."""
         d = self.request(bytes([0x18, status, group >> 8, group & 0xFF]))
         if len(d) < 2 or len(d) - 2 < d[1] * 3:
             raise KLineError(f"DTC reply shorter than its count: {d.hex()}")

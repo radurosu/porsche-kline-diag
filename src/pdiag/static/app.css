@@ -134,6 +134,31 @@ main { max-width: 1180px; margin: 0 auto; padding: 32px; }
 .ro.wide { grid-column: 1 / -1; }
 .live-note { color: var(--ink-2); font-size: 14px; max-width: 62ch; margin: 32px 0 0; }
 
+/* Everything else the engine computer reports: a quiet two-column list */
+.all-readings { margin-top: 40px; }
+.all-readings h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--ink-2); }
+dl.all {  /* fixed label columns: changing values never move anything */
+  display: grid; grid-template-columns: 16em minmax(0, 1fr) 16em minmax(0, 1fr);
+  column-gap: 24px; margin: 0;
+}
+dl.all dt, dl.all dd { margin: 0; padding: 8px 0; border-top: 1px solid var(--rule); font-size: 14px; }
+dl.all dt { color: var(--ink-2); }
+dl.all dd { font-weight: 500; overflow-wrap: anywhere; }
+dl.all.stale dd { opacity: 0.35; }
+
+/* Porsche data: raw DME blocks; bytes that move stand out, static ones recede */
+.dme-note { color: var(--ink-2); font-size: 14px; max-width: 64ch; margin: 0 0 20px; }
+.lid { display: grid; grid-template-columns: 10rem minmax(0, 1fr); gap: 16px; padding: 12px 0; border-top: 1px solid var(--rule); }
+.lid-name { font-weight: 700; font-stretch: var(--wide); }
+.lid-name small { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; font-stretch: 100%; color: var(--ink-2); }
+.bytes {
+  display: grid; grid-template-columns: repeat(16, 2.7ch); row-gap: 3px;
+  font-size: 15px; font-stretch: var(--narrow); text-transform: uppercase;
+}
+.bytes span { color: var(--ink-2); opacity: 0.45; }
+.bytes span.moved { color: var(--ink); opacity: 1; font-weight: 600; }
+.bytes span.hot { color: var(--amber); opacity: 1; font-weight: 700; }
+
 /* Report */
 .verdict { display: grid; grid-template-columns: 14px 1fr; gap: 18px; margin: 0 0 32px; max-width: 70ch; }
 .verdict::before { content: ""; border-radius: 7px; background: var(--teal); }
@@ -216,6 +241,8 @@ dl.info { display: grid; grid-template-columns: max-content 1fr; gap: 0; margin:
   main { padding: 24px 16px; }
   .colophon { padding: 16px 16px 32px; }
   .codes li { grid-template-columns: 1fr; }
+  dl.all { grid-template-columns: 14em minmax(0, 1fr); }
+  .lid { grid-template-columns: 1fr; gap: 6px; }
   .ranges .count { width: auto; }
   .ranges .when-full { display: none; }
 }
@@ -224,6 +251,7 @@ dl.info { display: grid; grid-template-columns: max-content 1fr; gap: 0; margin:
   .speed-m { display: block; }
   .ranges .r { width: auto; }
   .readouts { column-gap: 20px; }
+  .bytes { grid-template-columns: repeat(8, 2.7ch); }
 }
 @media (prefers-reduced-motion: reduce) {
   .wait::before { animation: none; }
